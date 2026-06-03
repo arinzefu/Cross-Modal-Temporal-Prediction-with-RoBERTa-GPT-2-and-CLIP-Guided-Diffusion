@@ -543,3 +543,20 @@ class TextDataset(Dataset):
             "attention_mask": attention_mask,
             "labels": torch.tensor(labels, dtype=torch.long),
         }
+
+class AutoEncoderDataset(Dataset):
+    def __init__(self, dataset):
+        self.dataset = dataset
+        self.transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),            # HxWxC -> CxHxW, range [0,1]
+        ])
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        frames = self.dataset[idx]["images"]              # variable-length list of PIL images
+        frame_idx = torch.randint(0, len(frames), (1,)).item()
+        img = frames[frame_idx].convert("RGB")
+        return self.transform(img)

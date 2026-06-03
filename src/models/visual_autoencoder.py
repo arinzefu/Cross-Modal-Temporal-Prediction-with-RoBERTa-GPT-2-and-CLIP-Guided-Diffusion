@@ -32,6 +32,15 @@ from typing import Dict, Any, List, Optional, Tuple
 import textwrap
 from tqdm import tqdm
 
+def init_weights(m):
+    if isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
+        # Use a slightly higher gain for leaky_relu to boost signal
+        nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='leaky_relu')
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0.01) # Small positive bias to keep neurons alive
+    elif isinstance(m, nn.Linear):
+        nn.init.xavier_normal_(m.weight)
+        nn.init.constant_(m.bias, 0)
 # =========================================================
 # Residual Block
 # =========================================================
