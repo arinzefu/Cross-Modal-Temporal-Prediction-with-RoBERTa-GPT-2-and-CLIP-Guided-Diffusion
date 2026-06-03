@@ -1,0 +1,10 @@
+Epoch 1
+CE Loss    : 12.37586
+Div Loss   : 0.00954
+Total Loss : 12.37729
+Scores:
+BLEU-4  : 0.0117
+METEOR  : 0.2051
+ROUGE-1 : 0.1818
+ROUGE-2 : 0.0412
+ROUGE-L : 0.1212
