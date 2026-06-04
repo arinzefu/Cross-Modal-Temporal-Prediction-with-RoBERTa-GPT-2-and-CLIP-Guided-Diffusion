@@ -8,7 +8,8 @@ from tqdm import tqdm
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
 import matplotlib.pyplot as plt
-# @title Early stopping
+
+
 # =========================================================
 # Early stopping
 # =========================================================
@@ -43,10 +44,15 @@ EVAL_LEVELS = (50, 200, 500)
 
 
 # =========================================================
-# History helper  (now stores per-level eval metrics)
+# History helpers
 # =========================================================
 def make_diffusion_history():
-    return {"epoch": [], "eps_mse": [], "eval": []}   # eval[i] = {L: {mse,ssim,psnr,lpips?}}
+    return {"epoch": [], "eps_mse": [], "eval": []}   # eval[i] = {L: {mse,ssim,psnr,lpips?}} or None
+
+
+def _has_levels(ev, levels):
+    """True only if ev is a full metrics dict containing every level."""
+    return isinstance(ev, dict) and all(L in ev for L in levels)
 
 
 # =========================================================
@@ -82,9 +88,14 @@ def load_checkpoint_from_drive(model, optimizer=None, filename="visual_autoencod
     epoch = checkpoint.get("epoch", 0)
     loss = checkpoint.get("loss", float("inf"))
     history = checkpoint.get("history", make_diffusion_history())
-    if "eval" not in history:                        # migrate old-format history
-        print("  (old history format detected \u2013 starting fresh metric history)")
-        history = make_diffusion_history()
+
+    # ---- normalize history so consumers never hit a bad/short eval list ----
+    history.setdefault("epoch", [])
+    history.setdefault("eps_mse", [])
+    history.setdefault("eval", [])
+    n = len(history["epoch"])
+    ev = (history["eval"] + [None] * n)[:n]                         # align length to epochs
+    history["eval"] = [e if isinstance(e, dict) else None for e in ev]  # malformed -> None
 
     print(f"\u2713 Checkpoint loaded from Drive: {full_path}  (epoch {epoch})")
     return model, optimizer, epoch, loss, history
@@ -138,30 +149,41 @@ def evaluate_diffusion(diffusion, x0, levels=EVAL_LEVELS, lpips_fn=None):
 
 
 # =========================================================
-# Per-epoch visual: target | denoised 50/200/500 | noisy 200
+# Per-epoch visual: grid of [noisy input | denoised | target] for each t
 # =========================================================
 @torch.no_grad()
-def _viz_epoch(diffusion, x0, recons, epoch, levels=EVAL_LEVELS, noisy_level=200):
+def _viz_epoch(diffusion, x0, recons, epoch, levels=EVAL_LEVELS, idx=0):
     device = x0.device
-    t = torch.full((1,), noisy_level, device=device, dtype=torch.long)
-    noisy = diffusion.q_sample(x0[:1], t)
 
-    panels = [x0[:1]] + [recons[L][:1] for L in levels] + [noisy]
-    titles = ["target"] + [f"denoised {L}" for L in levels] + [f"noise {noisy_level}"]
+    def to_img(t):                                    # [1,3,H,W] in [-1,1] -> HxWxC [0,1]
+        return ((t[0].cpu() + 1) / 2).permute(1, 2, 0).clamp(0, 1)
 
-    fig, ax = plt.subplots(1, len(panels), figsize=(3.4 * len(panels), 3.6))
-    for a, im, ti in zip(ax, panels, titles):
-        a.imshow(((im[0].cpu() + 1) / 2).permute(1, 2, 0).clamp(0, 1))
-        a.set_title(ti, fontsize=10)
-        a.axis("off")
-    plt.suptitle(f"Epoch {epoch}", fontsize=11)
+    n = len(levels)
+    fig, axes = plt.subplots(n, 3, figsize=(9, 3 * n))
+    axes = np.array(axes).reshape(n, 3)
+    col_titles = ["noisy input", "denoised", "target"]
+
+    xi = x0[idx:idx + 1]
+    for r, L in enumerate(levels):
+        t = torch.full((1,), L, device=device, dtype=torch.long)
+        noisy = diffusion.q_sample(xi, t)
+        imgs = [noisy, recons[L][idx:idx + 1], xi]
+        for c, im in enumerate(imgs):
+            ax = axes[r, c]
+            ax.imshow(to_img(im))
+            ax.set_xticks([]); ax.set_yticks([])
+            if r == 0:
+                ax.set_title(col_titles[c], fontsize=11)
+        axes[r, 0].set_ylabel(f"t = {L}", fontsize=12)
+
+    plt.suptitle(f"Epoch {epoch} \u2014 denoising at t = {list(levels)}", fontsize=12)
     plt.tight_layout()
     plt.show()
     plt.close(fig)
 
 
 # =========================================================
-# Metrics + loss graph (redrawn every epoch)
+# Metrics + loss graph (redrawn every epoch; skips epochs without eval)
 # =========================================================
 def plot_history(history, levels=EVAL_LEVELS):
     ep = history["epoch"]
@@ -169,7 +191,8 @@ def plot_history(history, levels=EVAL_LEVELS):
         return
 
     metric_names = ["mse", "ssim", "psnr"]
-    if history["eval"] and "lpips" in history["eval"][0][levels[0]]:
+    first_valid = next((e for e in history["eval"] if _has_levels(e, levels)), None)
+    if first_valid is not None and "lpips" in first_valid[levels[0]]:
         metric_names.append("lpips")
 
     n = 1 + len(metric_names)
@@ -184,8 +207,12 @@ def plot_history(history, levels=EVAL_LEVELS):
 
     for k, m in enumerate(metric_names, start=1):
         for L in levels:
-            vals = [history["eval"][i][L][m] for i in range(len(ep))]
-            axes[k].plot(ep, vals, marker="o", markersize=3, label=f"t={L}")
+            xs, ys = [], []
+            for i in range(len(ep)):
+                ev = history["eval"][i] if i < len(history["eval"]) else None
+                if _has_levels(ev, levels):
+                    xs.append(ep[i]); ys.append(ev[L][m])
+            axes[k].plot(xs, ys, marker="o", markersize=3, label=f"t={L}")
         axes[k].set_title(m.upper())
         axes[k].set_xlabel("epoch")
         axes[k].legend(fontsize=8)
@@ -200,7 +227,7 @@ def plot_history(history, levels=EVAL_LEVELS):
 
 
 # =========================================================
-# Log export  (full history rewritten each epoch -> never loses earlier epochs)
+# Log export  (full history rewritten each epoch; tolerates missing eval)
 # =========================================================
 def export_training_log(history, filename="training_diffusion_log.txt", levels=EVAL_LEVELS):
     os.makedirs(DRIVE_CHECKPOINT_FOLDER, exist_ok=True)
@@ -211,13 +238,16 @@ def export_training_log(history, filename="training_diffusion_log.txt", levels=E
         for i in range(len(history["epoch"])):
             f.write(f"Epoch {history['epoch'][i]}\n")
             f.write(f"  eps_mse : {history['eps_mse'][i]:.6f}\n")
-            ev = history["eval"][i]
-            for L in levels:
-                m = ev[L]
-                line = f"  t={L:<4}| MSE {m['mse']:.5f} | SSIM {m['ssim']:.4f} | PSNR {m['psnr']:.2f}"
-                if "lpips" in m:
-                    line += f" | LPIPS {m['lpips']:.4f}"
-                f.write(line + "\n")
+            ev = history["eval"][i] if i < len(history["eval"]) else None
+            if _has_levels(ev, levels):
+                for L in levels:
+                    m = ev[L]
+                    line = f"  t={L:<4}| MSE {m['mse']:.5f} | SSIM {m['ssim']:.4f} | PSNR {m['psnr']:.2f}"
+                    if "lpips" in m:
+                        line += f" | LPIPS {m['lpips']:.4f}"
+                    f.write(line + "\n")
+            else:
+                f.write("  (no eval this epoch)\n")
             f.write("\n")
 
         if history["epoch"]:
@@ -228,10 +258,12 @@ def export_training_log(history, filename="training_diffusion_log.txt", levels=E
             be = history["epoch"][history["eps_mse"].index(best)]
             f.write(f"Best eps_mse  : {best:.6f} (epoch {be})\n")
             mid = levels[len(levels) // 2]
-            ssim_mid = [history["eval"][i][mid]["ssim"] for i in range(len(history["epoch"]))]
-            bs = max(ssim_mid)
-            bse = history["epoch"][ssim_mid.index(bs)]
-            f.write(f"Best SSIM@{mid} : {bs:.4f} (epoch {bse})\n")
+            ssim_pts = [(history["epoch"][i], history["eval"][i][mid]["ssim"])
+                        for i in range(len(history["epoch"]))
+                        if i < len(history["eval"]) and _has_levels(history["eval"][i], levels)]
+            if ssim_pts:
+                be2, bs = max(ssim_pts, key=lambda p: p[1])
+                f.write(f"Best SSIM@{mid} : {bs:.4f} (epoch {be2})\n")
 
     print(f"\u2713 Training log saved to {filepath}")
 
@@ -255,7 +287,6 @@ def train_diffusion(
     early_stopper=None,
     eval_levels=EVAL_LEVELS,
     n_eval=4,
-    noisy_level=200,
     eval_every=1,
 ):
     clip_params = [p for n, p in model.named_parameters()
@@ -281,7 +312,7 @@ def train_diffusion(
     except Exception:
         print("LPIPS unavailable \u2013 run `pip install lpips` to enable it. Continuing with MSE/SSIM/PSNR.")
 
-    # ---- fixed eval batch (so metrics are comparable across epochs) ----
+    # ---- fixed eval batch (so metrics/visuals are comparable across epochs) ----
     eval_batch = next(iter(dataloader))
     eval_imgs = (eval_batch[0] if isinstance(eval_batch, (list, tuple)) else eval_batch).to(device)
     eval_imgs = F.interpolate(eval_imgs, (224, 224), mode="bilinear", align_corners=False)
@@ -325,17 +356,17 @@ def train_diffusion(
         avg = epoch_loss / max(1, len(dataloader))
 
         # ---- per-epoch evaluation (denoise from each level, score vs target) ----
-        do_eval = (eval_every and (epoch + 1) % eval_every == 0)
+        do_eval = bool(eval_every) and ((epoch + 1) % eval_every == 0)
         if do_eval:
             model.eval()
             metrics, recons = evaluate_diffusion(diffusion, eval_x0, eval_levels, lpips_fn)
             model.train()
         else:
-            metrics, recons = history["eval"][-1] if history["eval"] else {}, None
+            metrics, recons = None, None              # mark this epoch as "no eval"
 
         history["epoch"].append(epoch + 1)
         history["eps_mse"].append(avg)
-        history["eval"].append(metrics)
+        history["eval"].append(metrics)               # may be None; consumers skip it
 
         # ---- print ----
         print(f"\nEpoch {epoch+1}/{n_epochs} | eps_mse: {avg:.6f}")
@@ -353,7 +384,7 @@ def train_diffusion(
         export_training_log(history, filename=log_name, levels=eval_levels)
         plot_history(history, levels=eval_levels)
         if recons is not None:
-            _viz_epoch(diffusion, eval_x0, recons, epoch + 1, eval_levels, noisy_level)
+            _viz_epoch(diffusion, eval_x0, recons, epoch + 1, eval_levels)
 
         if early_stopper is not None and early_stopper.step(avg):
             print("Early stopping triggered.")
