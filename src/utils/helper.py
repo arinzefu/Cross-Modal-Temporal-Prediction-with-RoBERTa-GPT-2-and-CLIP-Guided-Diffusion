@@ -9,22 +9,13 @@ import re
 import matplotlib.pyplot as plt
 import numpy as np
 import os
-from nltk.translate.bleu_score import sentence_bleu
-import json
-import pandas as pd
-from torchinfo import summary
-from transformers import CLIPProcessor, CLIPModel, RobertaModel, RobertaTokenizer
-import evaluate
-from skimage.metrics import structural_similarity as ssim
-from skimage.metrics import peak_signal_noise_ratio as psnr
-import tqdm
-from datasets.fingerprint import random
+
 from torch.utils.data import Dataset, DataLoader, random_split
 import torchvision.transforms as transforms
 import torchvision.models as models
 import torchvision.transforms.functional as FT
 import math
-from transformers import BertTokenizer
+
 import gc
 import random
 import re
@@ -32,7 +23,14 @@ from typing import Dict, Any, List, Optional, Tuple
 import textwrap
 # This will prompt you to authorize Google Drive access
 from google.colab import drive
+# Turn these on/off to control the 4 optional improvements.
+USE_FRAME_AWARE_GROUNDING = True      # Option 2: align ROI to matching frame text embedding (instead of always frame 0)
+USE_CONTRASTIVE_ROI = True            # Option 1: InfoNCE-style contrastive grounding using batch negatives
+USE_ENTITY_POOLING = True             # Option 3: entity-specific pooling/consistency across batch by entity_id
+USE_COT_TEXT = True                   # Option 4: concatenate CoT text snippet to the frame descriptions
 
+# Contrastive temperature (only used if USE_CONTRASTIVE_ROI=True)
+CONTRASTIVE_TAU = 0.07
 def save_checkpoint_to_drive(model, optimizer, epoch, loss, filename="roberta_clip_checkpoint.pth"):
     """
     Saves the checkpoint directly to a specified folder in your mounted Google Drive.
@@ -284,89 +282,70 @@ def extract_cot_text_for_frame(chain_of_thought: str, frame_idx: int, max_chars:
 # @title Main dataset
 
 class SequencePredictionDataset(Dataset):
-    def __init__(self, original_dataset, tokenizer, K: int = 4, max_len: int = 120, image_hw=(224, 224)):
-        super(SequencePredictionDataset, self).__init__()
+    def __init__(self, original_dataset, enc_tokenizer, dec_tokenizer,
+                 K: int = 4, max_len: int = 120, target_max_len: int = 120,
+                 image_hw=(224, 224)):
+        super().__init__()
         self.dataset = original_dataset
-        self.tokenizer = tokenizer
+        self.enc_tokenizer = enc_tokenizer      # RoBERTa: per-frame descriptions -> encoder
+        self.dec_tokenizer = dec_tokenizer      # GPT-2:   next story -> decoder target
         self.K = K
         self.max_len = max_len
+        self.target_max_len = target_max_len
         self.image_hw = image_hw
-
         self.transform = transforms.Compose([
-            transforms.Resize(image_hw),  # Reasonable size based on our previous analysis
-            transforms.ToTensor(),  # HxWxC -> CxHxW
+            transforms.Resize(image_hw),
+            transforms.ToTensor(),
         ])
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        """
-        Selects a 5 frame sequence from the dataset. Sets 4 for training and the last one
-        as a target.
-
-        Returns:
-          frames:        [K, C, H, W]
-          descriptions:  [K, T]
-          image_target:  [C, H, W]
-          target_ids:    [1, T]
-          roi1, roi2:    [C, H, W] (cropped from CoT bboxes, if available)
-          roi_valid:     0/1
-          roi_frame:     frame index for roi1 (0..K-1) if available else -1
-          ent_id:        string id for the ROI entity (empty if none)
-        """
         frames = self.dataset[idx]["images"]
         image_attributes = parse_gdi_text(self.dataset[idx]["story"])
-
-        # CoT grounding annotations (may be missing / unparseable)
         cot = self.dataset[idx].get("chain_of_thought", "")
         cot_frames = parse_cot_grounding(cot)
 
         frame_tensors = []
-        description_list = []
+        enc_ids_list = []
+        enc_mask_list = []
 
         for frame_idx in range(self.K):
             image = FT.equalize(frames[frame_idx])
-            input_frame = self.transform(image)
-            frame_tensors.append(input_frame)
+            frame_tensors.append(self.transform(image))
 
             description = image_attributes[frame_idx]["description"]
-
-            # Option 4: include CoT text snippet for this frame (best-effort)
             if USE_COT_TEXT:
                 cot_txt = extract_cot_text_for_frame(cot, frame_idx)
                 if cot_txt:
                     description = description + " [COT] " + cot_txt
 
-            input_ids = self.tokenizer(
-                description,
-                return_tensors="pt",
-                padding="max_length",
-                truncation=True,
-                max_length=self.max_len
-            ).input_ids.squeeze(0)
+            enc = self.enc_tokenizer(
+                description, return_tensors="pt",
+                padding="max_length", truncation=True, max_length=self.max_len,
+            )
+            enc_ids_list.append(enc.input_ids.squeeze(0))          # [L]
+            enc_mask_list.append(enc.attention_mask.squeeze(0))    # [L]
 
-            description_list.append(input_ids)
+        # ---- target image: the next frame ----
+        image_target = self.transform(FT.equalize(frames[self.K]))  # [C,H,W] in [0,1]
 
-        image_target = FT.equalize(frames[self.K])
-        image_target = self.transform(image_target)
+        # ---- target text: the NEXT story step, tokenized with GPT-2 ----
+        target_description = image_attributes[self.K]["description"]
+        dec = self.dec_tokenizer(
+            target_description, return_tensors="pt",
+            padding="max_length", truncation=True, max_length=self.target_max_len,
+        )
 
-        main_description = image_attributes[0]["description"]
-        encoded = self.tokenizer(
-            main_description,
-            padding="max_length",
-            truncation=True,
-            max_length=self.max_len,
-            return_tensors="pt"
-        )  # [1, T]
+        text_dict = {
+            "enc_input_ids":          torch.stack(enc_ids_list),     # [K, L]  RoBERTa
+            "enc_attention_mask":     torch.stack(enc_mask_list),    # [K, L]
+            "target_ids":             dec.input_ids.squeeze(0),      # [S]     GPT-2 (decoder input)
+            "target_attention_mask":  dec.attention_mask.squeeze(0), # [S]
+        }
 
-        text_dict = {"input_ids": encoded['input_ids'][0],
-                     "attention_mask": encoded["attention_mask"][0],
-                     "decoder_input_ids": encoded["input_ids"][0, :-1],
-                     "target_ids": encoded["input_ids"][0, 1:]
-                     }
-
-        # ---- CoT ROI pair (Options 1-3 need these) ----
+        # ---- CoT ROI pair (unchanged) ----
         roi_valid = torch.tensor(0, dtype=torch.long)
         roi1 = torch.zeros((3, self.image_hw[0], self.image_hw[1]))
         roi2 = torch.zeros((3, self.image_hw[0], self.image_hw[1]))
@@ -376,7 +355,6 @@ class SequencePredictionDataset(Dataset):
         pair = pick_reid_pair(cot_frames)
         if pair is not None:
             f1, f2, b1, b2, ent_id = pair
-            # We only use ROIs that fall within the input window (0..K-1)
             if (0 <= f1 < self.K) and (0 <= f2 < self.K):
                 try:
                     roi1 = crop_and_resize(frames[f1], b1, out_hw=self.image_hw)
@@ -388,56 +366,57 @@ class SequencePredictionDataset(Dataset):
 
         sequence_tensor = torch.stack(frame_tensors)  # [K, C, H, W]
         obj_labels = tuple(["bg"] * self.K + ["bg"])
-
-        ent_id_tensor = torch.tensor([0], dtype=torch.long)  # placeholder
+        ent_id_tensor = torch.tensor([0], dtype=torch.long)
 
         return (
-            sequence_tensor,  # 0: frames,
-            image_target,
+            sequence_tensor,   # 0: frames [K,C,H,W]
+            image_target,      # 1: next frame [C,H,W]
             roi1, roi2, roi_valid, roi_frame,
-            ent_id_tensor,  # 6: ent_id as tensor
-            text_dict,  # 7: Text Dict
-            obj_labels  # 8: tuple
+            ent_id_tensor,     # 6
+            text_dict,         # 7
+            obj_labels,        # 8
         )
 
 class TextTaskDataset(Dataset):
-    def __init__(self, dataset, tokenizer, max_len=max_seq_len):
+    def __init__(self, dataset, enc_tokenizer, dec_tokenizer,
+                 max_len=max_seq_len, target_max_len=None, label_pad_id=-100):
         self.dataset = dataset
-        self.tokenizer = tokenizer
-        self.max_len = max_len
+        self.enc_tokenizer = enc_tokenizer        # RoBERTa: description -> encoder
+        self.dec_tokenizer = dec_tokenizer        # GPT-2:   description -> decoder target
+        self.max_len = min(max_len, 512)          # RoBERTa position cap
+        self.target_max_len = target_max_len or max_len
+        self.label_pad_id = label_pad_id
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, idx):
         sample = self.dataset[idx]
-
         image_attributes = parse_gdi_text(sample["story"])
         frame_idx = np.random.randint(0, len(image_attributes))
         description = image_attributes[frame_idx]["description"]
 
-        encoded = self.tokenizer(
-            description,
-            padding="max_length",
-            truncation=True,
-            max_length=self.max_len,
-            return_tensors="pt"
+        # ---- encoder input: description (RoBERTa) ----
+        enc = self.enc_tokenizer(
+            description, padding="max_length", truncation=True,
+            max_length=self.max_len, return_tensors="pt",
         )
+        input_ids = enc["input_ids"].squeeze(0)
+        attention_mask = enc["attention_mask"].squeeze(0)
 
-        input_ids = encoded["input_ids"].squeeze(0)
-        attention_mask = encoded["attention_mask"].squeeze(0)
-
-        decoder_input_ids = input_ids[:-1]
-        target_ids = input_ids[1:]
+        # ---- decoder target: same description (GPT-2), labels with -100 on pad ----
+        dec = self.dec_tokenizer(
+            description, padding="max_length", truncation=True,
+            max_length=self.target_max_len, return_tensors="pt",
+        )
+        labels = dec["input_ids"].squeeze(0)
+        labels[dec["attention_mask"].squeeze(0) == 0] = self.label_pad_id
 
         return {
-            "input_ids": input_ids,
+            "input_ids": input_ids,            # RoBERTa ids   -> encoder
             "attention_mask": attention_mask,
-            "decoder_input_ids": decoder_input_ids,
-            "target_ids": target_ids
+            "labels": labels,                  # GPT-2 ids, -100 on pad -> decoder/loss
         }
-
-
 
 
 

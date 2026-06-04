@@ -7,13 +7,12 @@ import matplotlib.pyplot as plt
 
 from tqdm import tqdm
 from transformers import get_cosine_schedule_with_warmup
+from src.training.train_visual import EarlyStopping, train_diffusion
+from test.visual_test import single_image_diffusion_test
 
 # =========================================================
 # GOOGLE DRIVE CHECKPOINT HELPERS
 # =========================================================
-from google.colab import drive
-drive.mount("/content/drive")
-
 DRIVE_CHECKPOINT_FOLDER = "/content/drive/MyDrive/DL_Checkpoints"
 
 

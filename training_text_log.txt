@@ -1,0 +1,10 @@
+=== TRAINING LOG ===
+
+Epoch 1
+  CE Loss     : 3.488919
+  Div Loss    : 0.000000
+  Total Loss  : 3.488919
+  BLEU        : 0.006791
+  ROUGE-1     : 0.167598
+  METEOR      : 0.210084
+
