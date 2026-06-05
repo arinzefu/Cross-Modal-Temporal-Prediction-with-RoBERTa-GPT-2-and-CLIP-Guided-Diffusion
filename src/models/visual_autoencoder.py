@@ -245,14 +245,24 @@ class CLIPDiffusionUNet(nn.Module):
         self.out = nn.Conv2d(b, 3, 3, padding=1)
         self.act = nn.SiLU()
 
-    def forward(self, x, t):
-        """x: noisy image in [-1, 1], t: long [B]. Returns predicted noise."""
+    def forward(self, x, t, cond_feat=None):
+        """x: noisy image in [-1, 1], t: long [B]. Returns predicted noise.
+
+        cond_feat: optional external CLIP condition [B, clip_ch, 14, 14]. If given
+        (or set via self._external_cond), it REPLACES the features normally computed
+        from x. This is what lets the predictor drive generation; weights unchanged.
+        """
         temb = self.time_mlp(t)
 
         cfeat = None
         if self.use_clip:
-            x01 = (x.clamp(-1, 1) + 1) * 0.5
-            cfeat = self.clip(x01)
+            if cond_feat is None:
+                cond_feat = getattr(self, "_external_cond", None)
+            if cond_feat is not None:
+                cfeat = cond_feat                                   # <-- use the external condition
+            else:
+                x01 = (x.clamp(-1, 1) + 1) * 0.5
+                cfeat = self.clip(x01)
 
         h0 = self.init(x)
         s0 = self.rb1(h0, temb)
@@ -276,8 +286,6 @@ class CLIPDiffusionUNet(nn.Module):
         h = self.urb1(torch.cat([self.up1(h), s0], 1), temb)
 
         return self.out(self.act(self.out_norm(h)))
-
-
 # =========================================================
 # Gaussian Diffusion (forward noising + reverse sampling)
 # =========================================================

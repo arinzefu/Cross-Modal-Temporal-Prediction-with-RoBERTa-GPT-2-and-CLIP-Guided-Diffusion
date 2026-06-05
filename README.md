@@ -32,6 +32,7 @@ Cross-Modal Temporal Prediction with RoBERTa–GPT-2 and CLIP-Guided Diffusion
 │   ├── training/                    # Training scripts
 │   │   ├── train_text.py
 │   │   ├── train_visual.py
+│   │   ├── train_predictor_logging.py 
 │   │   └── train_predictor.py
 │   │
 │   ├── utils/                       # Utility functions
@@ -39,6 +40,7 @@ Cross-Modal Temporal Prediction with RoBERTa–GPT-2 and CLIP-Guided Diffusion
 │   │
 │   └── test/                        # Model evaluation scripts
 │       ├── text_test.py
+│       ├── test_predictorpy
 │       └── visual_test.py
 │
 ├── 01_text_autoencoder_pretraining.ipynb
