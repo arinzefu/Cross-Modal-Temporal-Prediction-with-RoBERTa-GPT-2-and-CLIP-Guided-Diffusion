@@ -8,3 +8,27 @@ Epoch 1
   ROUGE-1     : 0.167598
   METEOR      : 0.210084
 
+Epoch 2
+  CE Loss     : 3.370114
+  Div Loss    : 0.000000
+  Total Loss  : 3.370114
+  BLEU        : 0.005219
+  ROUGE-1     : 0.169014
+  METEOR      : 0.271979
+
+Epoch 3
+  CE Loss     : 3.266478
+  Div Loss    : 0.000000
+  Total Loss  : 3.266478
+  BLEU        : 0.005089
+  ROUGE-1     : 0.151659
+  METEOR      : 0.227630
+
+Epoch 4
+  CE Loss     : 3.208140
+  Div Loss    : 0.000000
+  Total Loss  : 3.208140
+  BLEU        : 0.006964
+  ROUGE-1     : 0.175000
+  METEOR      : 0.144033
+

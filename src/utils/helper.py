@@ -113,7 +113,7 @@ def parse_gdi_text(text):
                     image_id = attr_name.replace('image', '')
                     break
 
-        x
+        
         if not image_id:
             tag_str = str(gdi)
             match = re.search(r'<gdi\s+image(\d+)', tag_str)
