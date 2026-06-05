@@ -1,5 +1,7 @@
 import os
 import math
+import copy
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -44,6 +46,51 @@ EVAL_LEVELS = (50, 200, 500)
 
 
 # =========================================================
+# EMA (exponential moving average of weights)
+# Continuation-safe: on resume it initialises from the loaded weights,
+# and its own state is persisted in the checkpoint so it carries across runs.
+# =========================================================
+class EMA:
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+    @torch.no_grad()
+    def update(self, model):
+        for k, v in model.state_dict().items():
+            s = self.shadow[k]
+            if v.is_floating_point():
+                s.mul_(self.decay).add_(v.detach(), alpha=1 - self.decay)
+            else:
+                s.copy_(v)
+
+    def state_dict(self):
+        return self.shadow
+
+    def load_state_dict(self, sd):
+        for k in self.shadow:
+            if k in sd:
+                self.shadow[k].copy_(sd[k].to(self.shadow[k].device))
+
+    @contextmanager
+    def average_parameters(self, model):
+        """Temporarily swap EMA weights into the model (for eval / sampling)."""
+        backup = copy.deepcopy(model.state_dict())
+        msd = model.state_dict()
+        to_load = {}
+        for k in msd:
+            if k in self.shadow:
+                to_load[k] = self.shadow[k].to(dtype=msd[k].dtype, device=msd[k].device)
+            else:
+                to_load[k] = msd[k]
+        model.load_state_dict(to_load)
+        try:
+            yield
+        finally:
+            model.load_state_dict(backup)
+
+
+# =========================================================
 # History helpers
 # =========================================================
 def make_diffusion_history():
@@ -59,19 +106,19 @@ def _has_levels(ev, levels):
 # Save / Load to Drive
 # =========================================================
 def save_checkpoint_to_drive(model, optimizer, epoch, loss, history,
-                             filename="visual_autoencoder.pth"):
+                             filename="visual_autoencoder.pth", ema_state=None):
     os.makedirs(DRIVE_CHECKPOINT_FOLDER, exist_ok=True)
     full_path = os.path.join(DRIVE_CHECKPOINT_FOLDER, filename)
-    torch.save(
-        {
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "loss": loss,
-            "history": history,
-        },
-        full_path,
-    )
+    ckpt = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "loss": loss,
+        "history": history,
+    }
+    if ema_state is not None:
+        ckpt["ema_state_dict"] = ema_state          # EMA travels with the checkpoint
+    torch.save(ckpt, full_path)
     print(f"\u2713 Checkpoint saved to Drive: {full_path}  (epoch {epoch})")
 
 
@@ -88,6 +135,7 @@ def load_checkpoint_from_drive(model, optimizer=None, filename="visual_autoencod
     epoch = checkpoint.get("epoch", 0)
     loss = checkpoint.get("loss", float("inf"))
     history = checkpoint.get("history", make_diffusion_history())
+    ema_state = checkpoint.get("ema_state_dict", None)   # may be absent on old checkpoints
 
     # ---- normalize history so consumers never hit a bad/short eval list ----
     history.setdefault("epoch", [])
@@ -98,7 +146,7 @@ def load_checkpoint_from_drive(model, optimizer=None, filename="visual_autoencod
     history["eval"] = [e if isinstance(e, dict) else None for e in ev]  # malformed -> None
 
     print(f"\u2713 Checkpoint loaded from Drive: {full_path}  (epoch {epoch})")
-    return model, optimizer, epoch, loss, history
+    return model, optimizer, epoch, loss, history, ema_state
 
 
 # =========================================================
@@ -288,18 +336,25 @@ def train_diffusion(
     eval_levels=EVAL_LEVELS,
     n_eval=4,
     eval_every=1,
+    use_ema=True,
+    ema_decay=0.999,
+    override_lr_on_resume=True,
+    eval_with_ema=True,
 ):
     clip_params = [p for n, p in model.named_parameters()
                    if n.startswith("clip.") and p.requires_grad]
     unet_params = [p for n, p in model.named_parameters()
                    if not n.startswith("clip.") and p.requires_grad]
 
-    param_groups = []
+    # build groups, remembering the target LR for each so we can re-apply post-resume
+    group_specs = []
     if clip_params:
-        param_groups.append({"params": clip_params, "lr": clip_lr})
+        group_specs.append((clip_params, clip_lr))
     if unet_params:
-        param_groups.append({"params": unet_params, "lr": unet_lr})
-    optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
+        group_specs.append((unet_params, unet_lr))
+    optimizer = torch.optim.AdamW(
+        [{"params": p, "lr": lr} for p, lr in group_specs], weight_decay=weight_decay)
+    target_lrs = [lr for _, lr in group_specs]
 
     # ---- optional LPIPS (the 4th metric) ----
     lpips_fn = None
@@ -321,15 +376,32 @@ def train_diffusion(
     # ---- resume ----
     start_epoch = 0
     history = make_diffusion_history()
+    ema_state = None
     if resume:
         try:
-            model, optimizer, start_epoch, init_loss, history = \
+            model, optimizer, start_epoch, init_loss, history, ema_state = \
                 load_checkpoint_from_drive(model, optimizer, filename=checkpoint_filename_v)
             print(f"Resuming from epoch {start_epoch + 1}")
             if early_stopper is not None:
                 early_stopper.best_loss = init_loss
         except FileNotFoundError:
             print("No checkpoint, training from scratch.")
+
+    # ---- LR override (must come AFTER load: optimizer.load_state_dict restores old LRs) ----
+    if override_lr_on_resume:
+        for g, lr in zip(optimizer.param_groups, target_lrs):
+            g["lr"] = lr
+        print(f"Learning rates set to: {[g['lr'] for g in optimizer.param_groups]}")
+
+    # ---- EMA: init from current (loaded) weights, then restore saved shadow if present ----
+    ema = None
+    if use_ema:
+        ema = EMA(model, decay=ema_decay)
+        if ema_state is not None:
+            ema.load_state_dict(ema_state)
+            print("EMA shadow restored from checkpoint.")
+        else:
+            print("EMA initialised from current weights.")
 
     # ---- loop ----
     for epoch in range(start_epoch, n_epochs):
@@ -349,6 +421,8 @@ def train_diffusion(
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
+            if ema is not None:
+                ema.update(model)
 
             epoch_loss += loss.item()
             pbar.set_postfix({"eps_mse": f"{loss.item():.4f}"})
@@ -359,7 +433,11 @@ def train_diffusion(
         do_eval = bool(eval_every) and ((epoch + 1) % eval_every == 0)
         if do_eval:
             model.eval()
-            metrics, recons = evaluate_diffusion(diffusion, eval_x0, eval_levels, lpips_fn)
+            if ema is not None and eval_with_ema:
+                with ema.average_parameters(model):       # eval/sample under EMA weights
+                    metrics, recons = evaluate_diffusion(diffusion, eval_x0, eval_levels, lpips_fn)
+            else:
+                metrics, recons = evaluate_diffusion(diffusion, eval_x0, eval_levels, lpips_fn)
             model.train()
         else:
             metrics, recons = None, None              # mark this epoch as "no eval"
@@ -380,7 +458,8 @@ def train_diffusion(
 
         # ---- save, log, graph, visual ----
         save_checkpoint_to_drive(model, optimizer, epoch + 1, avg, history,
-                                 filename=checkpoint_filename_v)
+                                 filename=checkpoint_filename_v,
+                                 ema_state=(ema.state_dict() if ema is not None else None))
         export_training_log(history, filename=log_name, levels=eval_levels)
         plot_history(history, levels=eval_levels)
         if recons is not None:
@@ -390,4 +469,4 @@ def train_diffusion(
             print("Early stopping triggered.")
             break
 
-    return model, optimizer, history
+    return model, optimizer, history, ema
