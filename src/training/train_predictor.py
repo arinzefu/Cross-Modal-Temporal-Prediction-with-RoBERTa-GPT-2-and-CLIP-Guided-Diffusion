@@ -399,6 +399,8 @@ def evaluate_predictor(predictor, diffusion, dataloader, dec_tokenizer, device,
 # =========================================================
 # Training loop  (latent/cond + text losses, AMP, grad-accum, resume, logging)
 # =========================================================
+from tqdm.auto import tqdm
+
 def train_predictor(
     predictor,
     diffusion,
@@ -409,8 +411,8 @@ def train_predictor(
     n_epochs=10,
     lr=2e-4,
     accum_steps=4,
-    w_cond=1.0,           # drives generation quality (the real visual objective)
-    w_latent=0.1,         # aux semantic latent (cosine)
+    w_cond=1.0,
+    w_latent=0.1,
     w_text=1.0,
     grad_clip=1.0,
     checkpoint_filename="sequence_predictor.pth",
@@ -421,24 +423,25 @@ def train_predictor(
 ):
     predictor.to(device)
 
-    # ── freeze the frozen generator + (by default) the RoBERTa encoder ──
+    # ── freeze the frozen generator + optionally RoBERTa encoder ──
     for p in predictor.visual_clip.parameters():
         p.requires_grad = False
+
     if freeze_text_encoder:
         for p in predictor.text_encoder.parameters():
             p.requires_grad = False
-    # everything else (projectors, temporal, fusion, dynamics, heads, GPT-2 decoder
-    # incl. its randomly-initialised cross-attention) stays trainable.
 
     trainable = [p for p in predictor.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=lr)
-    scaler = GradScaler()
+
+    use_cuda = device.type == "cuda" if hasattr(device, "type") else str(device).startswith("cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=use_cuda)
 
     pad_id = dec_tokenizer.pad_token_id
     if pad_id is None:
         pad_id = dec_tokenizer.eos_token_id
 
-    # ── optional LPIPS + HF metrics, loaded once ──
+    # ── optional LPIPS ──
     lpips_fn = None
     try:
         import lpips
@@ -449,6 +452,7 @@ def train_predictor(
     except Exception:
         print("LPIPS unavailable - `pip install lpips` to enable. Using MSE/SSIM/PSNR.")
 
+    # ── optional HF metrics ──
     rouge_metric = meteor_metric = None
     try:
         import evaluate
@@ -460,10 +464,14 @@ def train_predictor(
     # ── resume ──
     start_epoch = 0
     history = make_predictor_history()
+
     if resume:
         try:
             predictor, optimizer, start_epoch, _, history = load_predictor_checkpoint(
-                predictor, optimizer, filename=checkpoint_filename)
+                predictor,
+                optimizer,
+                filename=checkpoint_filename,
+            )
             print(f"Resuming from epoch {start_epoch + 1}")
         except FileNotFoundError:
             print("No predictor checkpoint - training from scratch.")
@@ -474,38 +482,67 @@ def train_predictor(
         last_cond = last_text = 0.0
         optimizer.zero_grad()
 
-        for step, batch in enumerate(train_loader):
+        pbar = tqdm(
+            enumerate(train_loader),
+            total=len(train_loader),
+            desc=f"Epoch {epoch + 1}/{n_epochs}",
+            leave=True,
+        )
+
+        for step, batch in pbar:
             frames, image_target, text_dict = _unpack(batch)
+
             frames = frames.to(device)
             image_target = image_target.to(device)
+
             enc_ids = text_dict["enc_input_ids"].to(device)
             enc_mask = text_dict["enc_attention_mask"].to(device)
             tgt_ids = text_dict["target_ids"].to(device)
             tgt_mask = text_dict["target_attention_mask"].to(device)
 
-            with autocast():
-                out = predictor(frames, enc_ids, enc_mask, tgt_ids, tgt_mask)
+            with torch.amp.autocast("cuda", enabled=use_cuda):
+                out = predictor(
+                    frames,
+                    enc_ids,
+                    enc_mask,
+                    tgt_ids,
+                    tgt_mask,
+                )
 
                 with torch.no_grad():
-                    true_cond = predictor.target_image_cond(image_target)     # [B,Cc,hc,wc]
-                    true_latent = predictor.target_image_latent(image_target)  # [B,512]
+                    true_cond = predictor.target_image_cond(image_target)
+                    true_latent = predictor.target_image_latent(image_target)
 
                 loss_cond = F.mse_loss(out["pred_image_cond"], true_cond)
+
                 loss_latent = 1 - F.cosine_similarity(
-                    out["pred_image_latent"], true_latent, dim=-1).mean()
+                    out["pred_image_latent"],
+                    true_latent,
+                    dim=-1,
+                ).mean()
 
                 logits = out["pred_text_logits"]
                 V = logits.size(-1)
-                loss_text = F.cross_entropy(
-                    logits[:, :-1].reshape(-1, V), tgt_ids[:, 1:].reshape(-1),
-                    ignore_index=pad_id)
 
-                loss = (w_cond * loss_cond + w_latent * loss_latent + w_text * loss_text) / accum_steps
+                loss_text = F.cross_entropy(
+                    logits[:, :-1].reshape(-1, V),
+                    tgt_ids[:, 1:].reshape(-1),
+                    ignore_index=pad_id,
+                )
+
+                loss = (
+                    w_cond * loss_cond
+                    + w_latent * loss_latent
+                    + w_text * loss_text
+                ) / accum_steps
 
             scaler.scale(loss).backward()
+
             running += loss.item() * accum_steps
             nb += 1
-            last_cond, last_text = float(loss_cond.item()), float(loss_text.item())
+
+            last_cond = float(loss_cond.item())
+            last_text = float(loss_text.item())
 
             if (step + 1) % accum_steps == 0:
                 scaler.unscale_(optimizer)
@@ -514,43 +551,81 @@ def train_predictor(
                 scaler.update()
                 optimizer.zero_grad()
 
+            pbar.set_postfix({
+                "loss": f"{running / max(1, nb):.4f}",
+                "cond": f"{last_cond:.4f}",
+                "text": f"{last_text:.4f}",
+                "accum": f"{(step % accum_steps) + 1}/{accum_steps}",
+            })
+
+        # handle leftover gradients if len(train_loader) is not divisible by accum_steps
+        if len(train_loader) % accum_steps != 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(trainable, grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+
         train_loss = running / max(1, nb)
 
-        # ── per-epoch evaluation (real pixel + text metrics) ──
+        print("Running validation...")
         metrics = evaluate_predictor(
-            predictor, diffusion, val_loader, dec_tokenizer, device,
-            n_visual=eval_n_visual, lpips_fn=lpips_fn,
-            rouge_metric=rouge_metric, meteor_metric=meteor_metric)
+            predictor,
+            diffusion,
+            val_loader,
+            dec_tokenizer,
+            device,
+            n_visual=eval_n_visual,
+            lpips_fn=lpips_fn,
+            rouge_metric=rouge_metric,
+            meteor_metric=meteor_metric,
+        )
 
-        # ── record history (resume-safe; drives the graphs) ──
         history["epoch"].append(epoch + 1)
         history["train_loss"].append(train_loss)
         history["text_loss"].append(metrics.get("text_loss"))
         history["image_loss"].append(last_cond)
+
         for k in ["bleu", "meteor", "rougeL", "mse", "ssim", "lpips", "psnr"]:
             history[k].append(metrics.get(k))
 
         def _f(v):
             return "n/a" if v is None else f"{v:.4f}"
-        print(f"Epoch {epoch+1}/{n_epochs} | loss {train_loss:.4f} "
-              f"(cond {last_cond:.4f}, text {last_text:.4f}) | "
-              f"BLEU {_f(metrics.get('bleu'))} ROUGE-L {_f(metrics.get('rougeL'))} "
-              f"METEOR {_f(metrics.get('meteor'))} | SSIM {_f(metrics.get('ssim'))} "
-              f"PSNR {_f(metrics.get('psnr'))} LPIPS {_f(metrics.get('lpips'))}")
 
-        # ── save + log + the three graphs (continue across resume) ──
-        save_predictor_checkpoint(predictor, optimizer, epoch + 1, train_loss, history,
-                                  filename=checkpoint_filename)
+        print(
+            f"Epoch {epoch + 1}/{n_epochs} | "
+            f"loss {train_loss:.4f} "
+            f"(cond {last_cond:.4f}, text {last_text:.4f}) | "
+            f"BLEU {_f(metrics.get('bleu'))} "
+            f"ROUGE-L {_f(metrics.get('rougeL'))} "
+            f"METEOR {_f(metrics.get('meteor'))} | "
+            f"SSIM {_f(metrics.get('ssim'))} "
+            f"PSNR {_f(metrics.get('psnr'))} "
+            f"LPIPS {_f(metrics.get('lpips'))}"
+        )
+
+        save_predictor_checkpoint(
+            predictor,
+            optimizer,
+            epoch + 1,
+            train_loss,
+            history,
+            filename=checkpoint_filename,
+        )
+
         export_predictor_log(history, filename=log_name)
+
         plot_loss(history)
         plot_text_metrics(history)
         plot_visual_metrics(history)
 
-    # ── final all-metrics bar chart (latest epoch) ──
     if history["epoch"]:
-        last = {k: history[k][-1] for k in
-                ["bleu", "rougeL", "meteor", "ssim", "lpips", "mse", "psnr"]
-                if history.get(k) and history[k][-1] is not None}
+        last = {
+            k: history[k][-1]
+            for k in ["bleu", "rougeL", "meteor", "ssim", "lpips", "mse", "psnr"]
+            if history.get(k) and history[k][-1] is not None
+        }
+
         plot_all_metrics_bar(last)
 
     return predictor, optimizer, history
