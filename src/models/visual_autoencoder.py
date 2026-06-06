@@ -185,7 +185,20 @@ class CLIPMultiScale(nn.Module):
     def global_latent(self, x01):
         """512-d normalized CLIP image embedding — handy for the sequence predictor."""
         x = self._prep(x01)
+
         feat = self.clip.get_image_features(pixel_values=x)
+
+        # Robustly handle different HuggingFace CLIP return types
+        if not torch.is_tensor(feat):
+            if hasattr(feat, "image_embeds") and feat.image_embeds is not None:
+                feat = feat.image_embeds
+            elif hasattr(feat, "pooler_output") and feat.pooler_output is not None:
+                feat = feat.pooler_output
+            elif hasattr(feat, "last_hidden_state") and feat.last_hidden_state is not None:
+                feat = feat.last_hidden_state[:, 0]
+            else:
+                raise TypeError(f"Unsupported CLIP output type: {type(feat)}")
+
         return F.normalize(feat, dim=-1)
 
 
