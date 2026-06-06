@@ -431,7 +431,107 @@ def _external_condition(unet_model, cond_feat):
 # =========================================================
 # Visual generation
 # =========================================================
+# =========================================================
+# Visual generation: DDIM pure-noise generation
+# =========================================================
 
+@torch.no_grad()
+def generate_frames_ddim_cond(
+    diffusion,
+    pred_cond,
+    image_size=GEN_SIZE,
+    steps=100,
+    eta=0.0,
+):
+    """
+    Pure-noise DDIM generation using an external condition.
+
+    This is now the main visual generation path:
+
+        random noise + predicted condition -> generated frame
+
+    It does NOT use frame 4.
+    """
+    diffusion.model.eval()
+
+    device = pred_cond.device
+    B = pred_cond.size(0)
+
+    x = torch.randn(
+        B,
+        3,
+        image_size,
+        image_size,
+        device=device,
+    )
+
+    times = torch.linspace(
+        diffusion.T - 1,
+        0,
+        steps,
+        device=device,
+    ).long()
+
+    for i in range(len(times)):
+        t_int = int(times[i].item())
+
+        if i == len(times) - 1:
+            prev_t_int = -1
+        else:
+            prev_t_int = int(times[i + 1].item())
+
+        t = torch.full(
+            (B,),
+            t_int,
+            device=device,
+            dtype=torch.long,
+        )
+
+        eps = diffusion.model(
+            x,
+            t,
+            cond_feat=pred_cond,
+        )
+
+        alpha_t = diffusion.alphas_cumprod[t_int].to(device)
+
+        if prev_t_int >= 0:
+            alpha_prev = diffusion.alphas_cumprod[prev_t_int].to(device)
+        else:
+            alpha_prev = torch.tensor(1.0, device=device)
+
+        sqrt_alpha_t = torch.sqrt(alpha_t)
+        sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
+
+        x0_pred = (
+            x - sqrt_one_minus_alpha_t * eps
+        ) / sqrt_alpha_t.clamp(min=1e-8)
+
+        x0_pred = x0_pred.clamp(-1, 1)
+
+        if prev_t_int < 0:
+            x = x0_pred
+        else:
+            if eta == 0.0:
+                sigma = 0.0
+            else:
+                sigma = eta * torch.sqrt(
+                    (1 - alpha_prev) / (1 - alpha_t)
+                    * (1 - alpha_t / alpha_prev)
+                )
+
+            direction = torch.sqrt(
+                torch.clamp(1 - alpha_prev - sigma ** 2, min=0.0)
+            ) * eps
+
+            noise = torch.randn_like(x) if eta > 0 else 0.0
+
+            x = torch.sqrt(alpha_prev) * x0_pred + direction + sigma * noise
+
+    return (x.clamp(-1, 1) + 1) / 2
+
+
+# Optional old DDPM pure-noise sampler for comparison only.
 @torch.no_grad()
 def generate_frames(
     diffusion,
@@ -439,9 +539,8 @@ def generate_frames(
     image_size=GEN_SIZE,
 ):
     """
-    Pure-noise generation.
-    Keep this for debugging/comparison only.
-    Your current diffusion model is weak at this path.
+    Old stochastic DDPM pure-noise generation.
+    Keep for comparison only. Main path should use generate_frames_ddim_cond().
     """
     device = pred_cond.device
 
@@ -453,60 +552,10 @@ def generate_frames(
         device=device,
     )
 
-    with _external_condition(diffusion.model, pred_cond):
-        out = diffusion.sample(
-            x_start=x,
-            t_start=diffusion.T - 1,
-        )
-
-    return (out.clamp(-1, 1) + 1) / 2
-
-
-@torch.no_grad()
-def generate_frames_from_context(
-    diffusion,
-    pred_cond,
-    context_frame,
-    t_start=250,
-    image_size=GEN_SIZE,
-):
-    """
-    Better generation for your current pretrained visual model.
-
-    Uses the 4th input frame as the starting visual canvas:
-        frame_4 -> add noise -> denoise using predicted next-frame condition.
-
-    This still predicts frame 5 from frames 1-4.
-    It does not use the target frame as input.
-    """
-    device = pred_cond.device
-
-    context_frame = F.interpolate(
-        context_frame,
-        size=(image_size, image_size),
-        mode="bilinear",
-        align_corners=False,
+    out = diffusion.sample(
+        x_start=x,
+        t_start=diffusion.T,
     )
-
-    x0 = context_frame * 2 - 1
-
-    t_start = min(int(t_start), diffusion.T - 1)
-
-    t = torch.full(
-        (x0.size(0),),
-        t_start,
-        device=device,
-        dtype=torch.long,
-    )
-
-    noise = torch.randn_like(x0)
-    x_t = diffusion.q_sample(x0, t, noise=noise)
-
-    with _external_condition(diffusion.model, pred_cond):
-        out = diffusion.sample(
-            x_start=x_t,
-            t_start=t_start,
-        )
 
     return (out.clamp(-1, 1) + 1) / 2
 
@@ -527,9 +576,6 @@ def generate_text(
 ):
     """
     Greedy GPT-2 decode conditioned on predictor's predicted text memory.
-
-    Fixed version:
-    predictor.forward now expects target_ids and target_attention_mask.
     """
     predictor.eval()
 
@@ -606,10 +652,24 @@ def evaluate_predictor(
     max_text_len=40,
     rouge_metric=None,
     meteor_metric=None,
-    visual_t_start=250,
-    use_context_generation=True,
+    ddim_steps=100,
+    monitor_w_cond=1.0,
+    monitor_w_latent=0.1,
+    monitor_w_text=1.0,
 ):
+    """
+    Evaluates:
+        text loss
+        condition loss
+        latent loss
+        weighted monitor loss for LR scheduling / early stopping
+        BLEU / ROUGE-L / METEOR
+        visual metrics using DDIM pure-noise + predicted condition
+
+    No frame-4 generation is used here.
+    """
     predictor.eval()
+    diffusion.model.eval()
 
     pad_id = dec_tokenizer.pad_token_id
 
@@ -620,6 +680,9 @@ def evaluate_predictor(
     ssim_v, psnr_v, mse_v, lpips_v = [], [], [], []
 
     text_loss_sum = 0.0
+    cond_loss_sum = 0.0
+    latent_loss_sum = 0.0
+
     nb = 0
     vis_done = 0
 
@@ -642,17 +705,54 @@ def evaluate_predictor(
             tgt_mask,
         )
 
+        # -------------------------
+        # Validation condition loss
+        # -------------------------
+        true_cond = predictor.target_image_cond(image_target)
+        true_latent = predictor.target_image_latent(image_target)
+
+        cond_loss = F.mse_loss(
+            out["pred_image_cond"],
+            true_cond,
+        )
+
+        pred_latent_norm = F.normalize(
+            out["pred_image_latent"],
+            dim=-1,
+        )
+
+        true_latent_norm = F.normalize(
+            true_latent,
+            dim=-1,
+        )
+
+        latent_loss = 1 - F.cosine_similarity(
+            pred_latent_norm,
+            true_latent_norm,
+            dim=-1,
+        ).mean()
+
+        cond_loss_sum += cond_loss.item()
+        latent_loss_sum += latent_loss.item()
+
+        # -------------------------
+        # Validation text loss
+        # -------------------------
         logits = out["pred_text_logits"]
         V = logits.size(-1)
 
-        text_loss_sum += F.cross_entropy(
+        text_loss = F.cross_entropy(
             logits[:, :-1].reshape(-1, V),
             tgt_ids[:, 1:].reshape(-1),
             ignore_index=pad_id,
-        ).item()
+        )
 
+        text_loss_sum += text_loss.item()
         nb += 1
 
+        # -------------------------
+        # Text generation metrics
+        # -------------------------
         gen = generate_text(
             predictor,
             frames,
@@ -684,23 +784,19 @@ def evaluate_predictor(
                     if ref else 0.0
                 )
 
+        # -------------------------
+        # Visual generation metrics
+        # -------------------------
         if n_visual > 0 and vis_done < n_visual:
             take = min(frames.size(0), n_visual - vis_done)
 
-            if use_context_generation:
-                gen_frames = generate_frames_from_context(
-                    diffusion=diffusion,
-                    pred_cond=out["pred_image_cond"][:take],
-                    context_frame=frames[:take, -1],
-                    t_start=visual_t_start,
-                    image_size=GEN_SIZE,
-                )
-            else:
-                gen_frames = generate_frames(
-                    diffusion=diffusion,
-                    pred_cond=out["pred_image_cond"][:take],
-                    image_size=GEN_SIZE,
-                )
+            gen_frames = generate_frames_ddim_cond(
+                diffusion=diffusion,
+                pred_cond=out["pred_image_cond"][:take],
+                image_size=GEN_SIZE,
+                steps=ddim_steps,
+                eta=0.0,
+            )
 
             tgt = F.interpolate(
                 image_target[:take],
@@ -754,8 +850,22 @@ def evaluate_predictor(
 
             vis_done += take
 
+    val_text_loss = text_loss_sum / max(1, nb)
+    val_cond_loss = cond_loss_sum / max(1, nb)
+    val_latent_loss = latent_loss_sum / max(1, nb)
+
+    monitor_loss = (
+        monitor_w_text * val_text_loss
+        + monitor_w_cond * val_cond_loss
+        + monitor_w_latent * val_latent_loss
+    )
+
     metrics = {
-        "text_loss": text_loss_sum / max(1, nb),
+        "text_loss": val_text_loss,
+        "cond_loss": val_cond_loss,
+        "latent_loss": val_latent_loss,
+        "monitor_loss": monitor_loss,
+
         "bleu": float(np.mean(bleu)) if bleu else None,
         "meteor": None,
         "rougeL": None,
@@ -784,8 +894,6 @@ def evaluate_predictor(
             pass
 
     return metrics
-
-
 # =========================================================
 # Validation display
 # =========================================================
@@ -800,17 +908,19 @@ def show_validation_prediction_debug(
     max_text_len=80,
     sample_idx=0,
     enc_tokenizer=None,
-    visual_t_start=250,
-    show_pure_noise_debug=False,
+    ddim_steps=100,
+    show_true_cond=True,
 ):
     """
-    Shows:
-    - Input 1-4 frames and texts
-    - Target frame/text
-    - Context + TRUE condition generation
-    - Context + PRED condition generation
+    Validation view after visual generator fine-tuning.
 
-    This is the most useful validation view for your current model.
+    Shows:
+        Input 1-4 frames + input texts
+        Target frame + target text
+        DDIM pure noise + TRUE condition
+        DDIM pure noise + PREDICTED condition
+
+    No frame-4 starting canvas is used.
     """
     predictor.eval()
     diffusion.model.eval()
@@ -888,48 +998,33 @@ def show_validation_prediction_debug(
     print(f"cond_cosine  : {cond_cos:.6f}")
     print(f"latent_cosine: {latent_cos:.6f}")
 
-    last_context_frame = frames[sample_idx:sample_idx + 1, -1]
-
-    pred_frame_context = generate_frames_from_context(
+    pred_frame = generate_frames_ddim_cond(
         diffusion=diffusion,
         pred_cond=pred_cond[sample_idx:sample_idx + 1],
-        context_frame=last_context_frame,
-        t_start=visual_t_start,
         image_size=GEN_SIZE,
+        steps=ddim_steps,
+        eta=0.0,
     )[0]
 
-    true_frame_context = generate_frames_from_context(
-        diffusion=diffusion,
-        pred_cond=true_cond[sample_idx:sample_idx + 1],
-        context_frame=last_context_frame,
-        t_start=visual_t_start,
-        image_size=GEN_SIZE,
-    )[0]
+    true_frame = None
 
-    tensor_stats("generated_context_pred_cond", pred_frame_context)
-    tensor_stats("generated_context_true_cond", true_frame_context)
-    tensor_stats("target_image", image_target[sample_idx])
-
-    pure_true_frame = None
-    pure_pred_frame = None
-
-    if show_pure_noise_debug:
-        pure_true_frame = generate_frames(
+    if show_true_cond:
+        true_frame = generate_frames_ddim_cond(
             diffusion=diffusion,
             pred_cond=true_cond[sample_idx:sample_idx + 1],
             image_size=GEN_SIZE,
+            steps=ddim_steps,
+            eta=0.0,
         )[0]
 
-        pure_pred_frame = generate_frames(
-            diffusion=diffusion,
-            pred_cond=pred_cond[sample_idx:sample_idx + 1],
-            image_size=GEN_SIZE,
-        )[0]
+    tensor_stats("generated_ddim_pred_cond", pred_frame)
 
-        tensor_stats("pure_noise_true_cond", pure_true_frame)
-        tensor_stats("pure_noise_pred_cond", pure_pred_frame)
+    if true_frame is not None:
+        tensor_stats("generated_ddim_true_cond", true_frame)
 
-    # Text generation from already-computed memory
+    tensor_stats("target_image", image_target[sample_idx])
+
+    # Text generation from predicted memory
     mem = out["text_memory"][sample_idx:sample_idx + 1]
 
     start_id = dec_tokenizer.bos_token_id
@@ -984,11 +1079,8 @@ def show_validation_prediction_debug(
     print(pred_text)
 
     n_input = frames.shape[1]
-    extra_cols = 3
 
-    if show_pure_noise_debug:
-        extra_cols = 5
-
+    extra_cols = 3 if show_true_cond else 2
     n_cols = n_input + extra_cols
 
     fig, ax = plt.subplots(
@@ -1034,8 +1126,7 @@ def show_validation_prediction_debug(
         ax[1, t].axis("off")
 
     target_col = n_input
-    true_col = n_input + 1
-    pred_col = n_input + 2
+    pred_col = n_input + 1
 
     show_img(
         ax[0, target_col],
@@ -1055,26 +1146,9 @@ def show_validation_prediction_debug(
     ax[1, target_col].axis("off")
 
     show_img(
-        ax[0, true_col],
-        true_frame_context,
-        f"Frame 4 + TRUE cond\nt={visual_t_start}",
-    )
-
-    ax[1, true_col].text(
-        0.5,
-        0.95,
-        "Uses frame 4 as starting canvas and the real target condition.",
-        ha="center",
-        va="top",
-        fontsize=9,
-        wrap=True,
-    )
-    ax[1, true_col].axis("off")
-
-    show_img(
         ax[0, pred_col],
-        pred_frame_context,
-        f"Frame 4 + PRED cond\nt={visual_t_start}",
+        pred_frame,
+        f"DDIM noise + PRED cond\nsteps={ddim_steps}",
     )
 
     ax[1, pred_col].text(
@@ -1088,43 +1162,25 @@ def show_validation_prediction_debug(
     )
     ax[1, pred_col].axis("off")
 
-    if show_pure_noise_debug:
-        pure_true_col = n_input + 3
-        pure_pred_col = n_input + 4
+    if show_true_cond:
+        true_col = n_input + 2
 
         show_img(
-            ax[0, pure_true_col],
-            pure_true_frame,
-            "Pure noise + TRUE cond",
+            ax[0, true_col],
+            true_frame,
+            f"DDIM noise + TRUE cond\nsteps={ddim_steps}",
         )
 
-        ax[1, pure_true_col].text(
+        ax[1, true_col].text(
             0.5,
             0.95,
-            "Debug only.",
+            "Upper-bound visual generator check.",
             ha="center",
             va="top",
             fontsize=9,
             wrap=True,
         )
-        ax[1, pure_true_col].axis("off")
-
-        show_img(
-            ax[0, pure_pred_col],
-            pure_pred_frame,
-            "Pure noise + PRED cond",
-        )
-
-        ax[1, pure_pred_col].text(
-            0.5,
-            0.95,
-            "Debug only.",
-            ha="center",
-            va="top",
-            fontsize=9,
-            wrap=True,
-        )
-        ax[1, pure_pred_col].axis("off")
+        ax[1, true_col].axis("off")
 
     plt.tight_layout()
     plt.show()
@@ -1278,10 +1334,6 @@ def debug_temporal_dependency(
     device,
     sample_idx=0,
 ):
-    """
-    Tests whether the predictor is really using frames/texts 1-3,
-    or mostly relying on frame/text 4.
-    """
     predictor.eval()
 
     batch = next(iter(dataloader))
@@ -1424,15 +1476,15 @@ def train_predictor(
     val_loader,
     dec_tokenizer,
     device,
-    n_epochs=10,
+    n_epochs=150,
     lr=2e-4,
     accum_steps=4,
     w_cond=1.0,
     w_latent=0.1,
     w_text=1.0,
     grad_clip=1.0,
-    checkpoint_filename="sequence_predictor.pth",
-    log_name="training_predictor.txt",
+    checkpoint_filename="sequence_predictor_ddim.pth",
+    log_name="training_predictor_ddim.txt",
     resume=True,
     eval_n_visual=1,
     freeze_text_encoder=True,
@@ -1440,23 +1492,61 @@ def train_predictor(
     val_sample_idx=0,
     val_max_text_len=80,
     enc_tokenizer=None,
-    visual_t_start=250,
+    ddim_steps=100,
     show_text_debug=True,
-    show_pure_noise_debug=False,
+    show_true_cond=True,
     run_temporal_debug_every=0,
+
+    # Early stopping
+    early_stopping=True,
+    early_stopping_patience=15,
+    early_stopping_min_delta=1e-4,
+    early_stopping_metric="monitor_loss",
+    best_checkpoint_filename="sequence_predictor_ddim_best.pth",
+
+    # LR scheduler
+    use_lr_scheduler=True,
+    lr_scheduler_patience=5,
+    lr_scheduler_factor=0.5,
+    lr_scheduler_min_lr=1e-6,
+    lr_scheduler_min_delta=1e-4,
+
+    # Resume behaviour
+    reset_optimizer_lr_on_resume=True,
 ):
     predictor.to(device)
+    diffusion.model.to(device)
 
-    # Freeze visual CLIP feature extractor.
+    # ---------------------------------------------------------
+    # Freeze full visual generator after external-condition FT
+    # ---------------------------------------------------------
+    diffusion.model.eval()
+
+    for p in diffusion.model.parameters():
+        p.requires_grad = False
+
+    # ---------------------------------------------------------
+    # Freeze predictor visual CLIP feature extractor
+    # ---------------------------------------------------------
     for p in predictor.visual_clip.parameters():
         p.requires_grad = False
 
-    # Freeze RoBERTa encoder if requested.
+    # ---------------------------------------------------------
+    # Optionally freeze RoBERTa encoder
+    # ---------------------------------------------------------
     if freeze_text_encoder:
         for p in predictor.text_encoder.parameters():
             p.requires_grad = False
 
-    trainable = [p for p in predictor.parameters() if p.requires_grad]
+    trainable = [
+        p for p in predictor.parameters()
+        if p.requires_grad
+    ]
+
+    print(
+        "Trainable sequence predictor parameters:",
+        sum(p.numel() for p in trainable),
+    )
 
     optimizer = torch.optim.AdamW(
         trainable,
@@ -1479,7 +1569,9 @@ def train_predictor(
     if pad_id is None:
         pad_id = dec_tokenizer.eos_token_id
 
+    # ---------------------------------------------------------
     # Optional LPIPS
+    # ---------------------------------------------------------
     lpips_fn = None
 
     try:
@@ -1495,7 +1587,9 @@ def train_predictor(
     except Exception:
         print("LPIPS unavailable - `pip install lpips` to enable. Using MSE/SSIM/PSNR.")
 
+    # ---------------------------------------------------------
     # Optional HF metrics
+    # ---------------------------------------------------------
     rouge_metric = None
     meteor_metric = None
 
@@ -1508,9 +1602,17 @@ def train_predictor(
     except Exception:
         print("HF `evaluate` unavailable - METEOR/ROUGE-L will be skipped.")
 
+    # ---------------------------------------------------------
     # Resume
+    # ---------------------------------------------------------
     start_epoch = 0
     history = make_predictor_history()
+
+    # Extra history keys for new scheduler/early-stopping setup
+    history.setdefault("cond_loss", [])
+    history.setdefault("latent_loss", [])
+    history.setdefault("monitor_loss", [])
+    history.setdefault("lr", [])
 
     if resume:
         try:
@@ -1520,19 +1622,87 @@ def train_predictor(
                 filename=checkpoint_filename,
             )
 
+            history.setdefault("cond_loss", [])
+            history.setdefault("latent_loss", [])
+            history.setdefault("monitor_loss", [])
+            history.setdefault("lr", [])
+
             print(f"Resuming from epoch {start_epoch + 1}")
+
+            if reset_optimizer_lr_on_resume:
+                for group in optimizer.param_groups:
+                    group["lr"] = lr
+
+                print(f"Optimizer LR reset to {lr}")
 
         except FileNotFoundError:
             print("No predictor checkpoint - training from scratch.")
 
+    # ---------------------------------------------------------
+    # LR scheduler
+    # ---------------------------------------------------------
+    scheduler = None
+
+    if use_lr_scheduler:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=lr_scheduler_factor,
+            patience=lr_scheduler_patience,
+            threshold=lr_scheduler_min_delta,
+            threshold_mode="abs",
+            min_lr=lr_scheduler_min_lr,
+        )
+
+        print(
+            "LR scheduler enabled: "
+            f"ReduceLROnPlateau(factor={lr_scheduler_factor}, "
+            f"patience={lr_scheduler_patience}, "
+            f"min_lr={lr_scheduler_min_lr})"
+        )
+
+    # ---------------------------------------------------------
+    # Early stopping
+    # ---------------------------------------------------------
+    early_stopper = EarlyStopping(
+        patience=early_stopping_patience,
+        min_delta=early_stopping_min_delta,
+        verbose=True,
+    )
+
+    previous_monitor_values = [
+        v for v in history.get("monitor_loss", [])
+        if v is not None
+    ]
+
+    best_monitor = min(previous_monitor_values) if previous_monitor_values else None
+
+    if best_monitor is not None:
+        early_stopper.best_loss = best_monitor
+        print(f"Best previous monitor loss: {best_monitor:.6f}")
+
+    def get_current_lr():
+        return optimizer.param_groups[0]["lr"]
+
+    # =========================================================
+    # Main training loop
+    # =========================================================
     for epoch in range(start_epoch, n_epochs):
         predictor.train()
+
+        # Keep frozen modules in eval mode even after predictor.train()
+        diffusion.model.eval()
+        predictor.visual_clip.eval()
+
+        if freeze_text_encoder:
+            predictor.text_encoder.eval()
 
         running = 0.0
         nb = 0
 
         last_cond = 0.0
         last_text = 0.0
+        last_latent = 0.0
 
         optimizer.zero_grad()
 
@@ -1567,11 +1737,17 @@ def train_predictor(
                     true_cond = predictor.target_image_cond(image_target)
                     true_latent = predictor.target_image_latent(image_target)
 
+                # -------------------------
+                # Visual condition loss
+                # -------------------------
                 loss_cond = F.mse_loss(
                     out["pred_image_cond"],
                     true_cond,
                 )
 
+                # -------------------------
+                # Visual latent loss
+                # -------------------------
                 pred_latent_norm = F.normalize(
                     out["pred_image_latent"],
                     dim=-1,
@@ -1588,6 +1764,9 @@ def train_predictor(
                     dim=-1,
                 ).mean()
 
+                # -------------------------
+                # Text loss
+                # -------------------------
                 logits = out["pred_text_logits"]
                 V = logits.size(-1)
 
@@ -1610,6 +1789,7 @@ def train_predictor(
 
             last_cond = float(loss_cond.item())
             last_text = float(loss_text.item())
+            last_latent = float(loss_latent.item())
 
             if (step + 1) % accum_steps == 0:
                 scaler.unscale_(optimizer)
@@ -1627,12 +1807,14 @@ def train_predictor(
                 {
                     "loss": f"{running / max(1, nb):.4f}",
                     "cond": f"{last_cond:.4f}",
+                    "latent": f"{last_latent:.4f}",
                     "text": f"{last_text:.4f}",
+                    "lr": f"{get_current_lr():.2e}",
                     "accum": f"{(step % accum_steps) + 1}/{accum_steps}",
                 }
             )
 
-        # Handle leftover gradients when dataloader length is not divisible by accum_steps.
+        # Handle leftover gradients when dataloader length is not divisible by accum_steps
         if len(train_loader) % accum_steps != 0:
             scaler.unscale_(optimizer)
 
@@ -1647,7 +1829,9 @@ def train_predictor(
 
         train_loss = running / max(1, nb)
 
-        # Show validation sample before slower full metrics.
+        # -----------------------------------------------------
+        # Show validation sample before slower full metrics
+        # -----------------------------------------------------
         if show_val_sample:
             print("\nShowing validation prediction...")
 
@@ -1660,8 +1844,8 @@ def train_predictor(
                 max_text_len=val_max_text_len,
                 sample_idx=val_sample_idx,
                 enc_tokenizer=enc_tokenizer,
-                visual_t_start=visual_t_start,
-                show_pure_noise_debug=show_pure_noise_debug,
+                ddim_steps=ddim_steps,
+                show_true_cond=show_true_cond,
             )
 
             if show_text_debug:
@@ -1682,6 +1866,9 @@ def train_predictor(
                     sample_idx=val_sample_idx,
                 )
 
+        # -----------------------------------------------------
+        # Validation metrics
+        # -----------------------------------------------------
         print("Running validation metrics...")
 
         metrics = evaluate_predictor(
@@ -1694,14 +1881,50 @@ def train_predictor(
             lpips_fn=lpips_fn,
             rouge_metric=rouge_metric,
             meteor_metric=meteor_metric,
-            visual_t_start=visual_t_start,
-            use_context_generation=True,
+            ddim_steps=ddim_steps,
+            monitor_w_cond=w_cond,
+            monitor_w_latent=w_latent,
+            monitor_w_text=w_text,
         )
+
+        monitor_value = metrics.get(early_stopping_metric)
+
+        if monitor_value is None:
+            monitor_value = metrics.get("monitor_loss")
+
+        if monitor_value is None:
+            monitor_value = metrics.get("text_loss")
+
+        if monitor_value is None:
+            monitor_value = train_loss
+
+        old_lr = get_current_lr()
+
+        if scheduler is not None:
+            scheduler.step(monitor_value)
+
+        new_lr = get_current_lr()
+
+        if new_lr != old_lr:
+            print(f"LR reduced: {old_lr:.2e} -> {new_lr:.2e}")
+
+        # -----------------------------------------------------
+        # Record history
+        # -----------------------------------------------------
+        history.setdefault("cond_loss", [])
+        history.setdefault("latent_loss", [])
+        history.setdefault("monitor_loss", [])
+        history.setdefault("lr", [])
 
         history["epoch"].append(epoch + 1)
         history["train_loss"].append(train_loss)
         history["text_loss"].append(metrics.get("text_loss"))
         history["image_loss"].append(last_cond)
+
+        history["cond_loss"].append(metrics.get("cond_loss"))
+        history["latent_loss"].append(metrics.get("latent_loss"))
+        history["monitor_loss"].append(metrics.get("monitor_loss"))
+        history["lr"].append(new_lr)
 
         for k in [
             "bleu",
@@ -1719,16 +1942,50 @@ def train_predictor(
 
         print(
             f"Epoch {epoch + 1}/{n_epochs} | "
-            f"loss {train_loss:.4f} "
-            f"(cond {last_cond:.4f}, text {last_text:.4f}) | "
+            f"train_loss {train_loss:.4f} | "
+            f"val_monitor {monitor_value:.4f} | "
+            f"val_text {metrics.get('text_loss'):.4f} | "
+            f"val_cond {metrics.get('cond_loss'):.4f} | "
+            f"val_latent {metrics.get('latent_loss'):.4f} | "
+            f"last_train_cond {last_cond:.4f}, "
+            f"last_train_text {last_text:.4f} | "
             f"BLEU {_f(metrics.get('bleu'))} "
             f"ROUGE-L {_f(metrics.get('rougeL'))} "
             f"METEOR {_f(metrics.get('meteor'))} | "
             f"SSIM {_f(metrics.get('ssim'))} "
             f"PSNR {_f(metrics.get('psnr'))} "
-            f"LPIPS {_f(metrics.get('lpips'))}"
+            f"LPIPS {_f(metrics.get('lpips'))} | "
+            f"LR {new_lr:.2e}"
         )
 
+        # -----------------------------------------------------
+        # Save best checkpoint
+        # -----------------------------------------------------
+        is_best = (
+            best_monitor is None
+            or monitor_value < best_monitor - early_stopping_min_delta
+        )
+
+        if is_best:
+            best_monitor = monitor_value
+
+            save_predictor_checkpoint(
+                predictor,
+                optimizer,
+                epoch + 1,
+                monitor_value,
+                history,
+                filename=best_checkpoint_filename,
+            )
+
+            print(
+                f"✓ New best model saved: {best_checkpoint_filename} "
+                f"with {early_stopping_metric}={monitor_value:.6f}"
+            )
+
+        # -----------------------------------------------------
+        # Save latest checkpoint/log/plots
+        # -----------------------------------------------------
         save_predictor_checkpoint(
             predictor,
             optimizer,
@@ -1746,6 +2003,19 @@ def train_predictor(
         plot_loss(history)
         plot_text_metrics(history)
         plot_visual_metrics(history)
+
+        # -----------------------------------------------------
+        # Early stopping
+        # -----------------------------------------------------
+        if early_stopping:
+            should_stop = early_stopper.step(monitor_value)
+
+            if should_stop:
+                print(
+                    f"Early stopping triggered at epoch {epoch + 1}. "
+                    f"Best {early_stopping_metric}: {best_monitor:.6f}"
+                )
+                break
 
     if history["epoch"]:
         last = {
