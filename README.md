@@ -2,7 +2,9 @@
 
 This work is still in progress but it is built on my school project work from this repo - https://github.com/arinzeuwazurike/dnnls_final_project.git
 
-In my previous work I showed the progress in how changes in the text and visual autoencoder improved the sequence prediction but here I am implementing my suggessions by pairing the ROberta encoder with gpt2 transformer and turning the visual autoencoder to a complete CLIP denoising diffusion style autoencoder
+The diffusion was unable to generate from pure noise so this project became - Cross-Modal Temporal Story-Frame Prediction with RoBERTa-GPT-2 and CLIP Autoencoders.
+
+I used the visual autoencoder for a latent prediction task instead
 
 Currently still pretraining the visual and text autoencoder but this is the link to the pretrained so far.
 - https://drive.google.com/drive/folders/1bKR48-lXS1MFUVnGXH8SPxhxtDFmo7CB?usp=sharing
@@ -24,7 +26,6 @@ Cross-Modal Temporal Prediction with RoBERTa–GPT-2 and CLIP-Guided Diffusion
 │   ├── inference/                   # Inference pipeline
 │   │
 │   ├── models/                      # Model architectures
-│   │   ├── attention.py
 │   │   ├── multimodal_predictor.py
 │   │   ├── text_autoencoder.py
 │   │   └── visual_autoencoder.py
@@ -32,7 +33,6 @@ Cross-Modal Temporal Prediction with RoBERTa–GPT-2 and CLIP-Guided Diffusion
 │   ├── training/                    # Training scripts
 │   │   ├── train_text.py
 │   │   ├── train_visual.py
-│   │   ├── train_predictor_logging.py 
 │   │   └── train_predictor.py
 │   │
 │   ├── utils/                       # Utility functions
@@ -40,7 +40,7 @@ Cross-Modal Temporal Prediction with RoBERTa–GPT-2 and CLIP-Guided Diffusion
 │   │
 │   └── test/                        # Model evaluation scripts
 │       ├── text_test.py
-│       ├── test_predictorpy
+│       ├── test_predictor.py
 │       └── visual_test.py
 │
 ├── 01_text_autoencoder_pretraining.ipynb

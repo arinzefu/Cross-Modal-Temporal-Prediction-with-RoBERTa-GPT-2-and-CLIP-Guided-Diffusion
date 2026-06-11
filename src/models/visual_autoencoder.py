@@ -1,379 +1,593 @@
-# @title Importing the necessary libraries
+# =========================================================
+# visual_autoencoder.py
+# =========================================================
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import clip
-
-from transformers import CLIPProcessor, CLIPModel, RobertaModel, RobertaTokenizer
-import evaluate
-from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
-from diffusers import UNet2DConditionModel, DDPMScheduler
-from torch.utils.data import Dataset, DataLoader, random_split
-import torchvision.transforms as transforms
-import torchvision.models as models
-import torchvision.transforms.functional as FT
-import math
-
-
+from transformers import CLIPModel
+from torchvision import models
 def init_weights(m):
     if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
-        nn.init.kaiming_normal_(m.weight, mode="fan_in", nonlinearity="relu")
+        nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
         if m.bias is not None:
-            nn.init.constant_(m.bias, 0.0)
+            nn.init.zeros_(m.bias)
     elif isinstance(m, nn.Linear):
-        nn.init.xavier_normal_(m.weight)
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0.0)
-
-
-def zero_init_output(model):
-    nn.init.zeros_(model.out.weight)
-    nn.init.zeros_(model.out.bias)# =========================================================
-# Helpers
-# =========================================================
-
-def extract(a, t, x_shape):
-    """Gather schedule values a[t] and reshape to broadcast over x."""
-    b = t.shape[0]
-    out = a.gather(0, t)
-    return out.reshape(b, *([1] * (len(x_shape) - 1)))
-
-
-def gn(ch, groups=8):
-    # all channel counts used here are multiples of 8
-    return nn.GroupNorm(groups, ch)
-
-
-class SinusoidalPosEmb(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, t):
-        device = t.device
-        half = self.dim // 2
-        freqs = math.log(10000) / (half - 1)
-        freqs = torch.exp(torch.arange(half, device=device) * -freqs)
-        args = t[:, None].float() * freqs[None, :]
-        return torch.cat([args.sin(), args.cos()], dim=-1)
-
+        nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+        if m.bias is not None:          # guard — your version assumed bias exists
+            nn.init.zeros_(m.bias)
 
 # =========================================================
-# Time-conditioned Residual Block (FiLM-style time injection)
+# Residual Block
 # =========================================================
 
-class ResBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, time_dim):
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
         super().__init__()
-        self.norm1 = gn(in_ch)
-        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
-        self.time = nn.Linear(time_dim, out_ch)
-        self.norm2 = gn(out_ch)
-        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
-        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
-        self.act = nn.SiLU()
 
-    def forward(self, x, t_emb):
-        h = self.conv1(self.act(self.norm1(x)))
-        h = h + self.time(t_emb)[:, :, None, None]
-        h = self.conv2(self.act(self.norm2(h)))
-        return h + self.skip(x)
-
-
-class AttentionBlock(nn.Module):
-    def __init__(self, channels, num_heads=8):
-        super().__init__()
-        self.norm = gn(channels)
-        self.attn = nn.MultiheadAttention(channels, num_heads, batch_first=True)
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        h = self.norm(x).view(B, C, H * W).transpose(1, 2)
-        out, _ = self.attn(h, h, h)
-        return x + out.transpose(1, 2).view(B, C, H, W)
-
-
-class Down(nn.Module):
-    def __init__(self, ch):
-        super().__init__()
-        self.op = nn.Conv2d(ch, ch, 3, stride=2, padding=1)
-
-    def forward(self, x):
-        return self.op(x)
-
-
-class Up(nn.Module):
-    def __init__(self, ch):
-        super().__init__()
-        self.op = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="nearest"),
-            nn.Conv2d(ch, ch, 3, padding=1),
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.GroupNorm(8, channels),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.GroupNorm(8, channels),
         )
 
+        self.act = nn.GELU()
+
     def forward(self, x):
-        return self.op(x)
+        return self.act(x + self.block(x))
 
 
 # =========================================================
-# CLIP multi-scale conditioning encoder (low / mid / high)
+# CLIP Encoder
 # =========================================================
 
-class CLIPMultiScale(nn.Module):
+class CLIPEncoderWrapper(nn.Module):
     """
-    Extracts hidden states from 3 depths of CLIP ViT-B/16:
-        low  -> texture / edges
-        mid  -> parts / local structure
-        high -> semantics
-    Each is [B, 196, 768] -> reshaped to [B, 768, 14, 14] -> projected.
-    Returned concatenated as conditioning at the U-Net bottleneck.
+    CLIP encoder that returns:
+
+    z:
+        compact global latent [B, latent_dim]
+
+    spatial:
+        compressed spatial latent [B, spatial_dim, 14, 14]
+
+    low/mid/high:
+        optional raw CLIP feature maps for analysis or auxiliary losses
+
+    NOTE on the spatial path: low/mid/high come from CLIP hidden_states
+    [3], [6], [9], which are ALWAYS frozen (only the last `unfreeze_layers`
+    vision layers are trainable). So the spatial latent's geometry is fixed
+    CLIP semantics; only the 1x1 projections adapt. That is fine for
+    reconstruction but it is the part of the latent that is hardest to
+    predict, so keep an eye on it when training the SequencePredictor.
     """
-    def __init__(self, layers=(4, 8, 12), proj_ch=128, unfreeze=4, backbone=None):
+
+    def __init__(
+        self,
+        latent_dim=128,
+        spatial_dim=256,
+        unfreeze_layers=2,
+        clip_model_name="openai/clip-vit-base-patch16",
+    ):
         super().__init__()
-        if backbone is not None:
-            self.clip = backbone
-        else:
-            from transformers import CLIPModel  # lazy import
-            self.clip = CLIPModel.from_pretrained("openai/clip-vit-base-patch16")
 
+        self.clip = CLIPModel.from_pretrained(clip_model_name)
+
+        self.clip.vision_model.config.output_hidden_states = True
+        self.clip.config.output_hidden_states = True
+
+        # Freeze CLIP first
         for p in self.clip.parameters():
             p.requires_grad = False
-        for layer in self.clip.vision_model.encoder.layers[-unfreeze:]:
-            for p in layer.parameters():
-                p.requires_grad = True
 
-        self.layers = layers
-        self.projs = nn.ModuleList([
-            nn.Sequential(nn.Conv2d(768, proj_ch, 1), gn(proj_ch), nn.SiLU())
-            for _ in layers
-        ])
-        self.out_ch = proj_ch * len(layers)
+        # Optionally unfreeze last N CLIP vision layers
+        if unfreeze_layers > 0:
+            for layer in self.clip.vision_model.encoder.layers[-unfreeze_layers:]:
+                for p in layer.parameters():
+                    p.requires_grad = True
 
-        # --- robust feature capture via forward hooks ---
-        # hidden_states[idx] == output of encoder layer (idx-1), so we hook
-        # layer (idx-1). This does not depend on return_dict behavior, which
-        # varies across transformers versions.
-        self._feats = {}
-        enc = self.clip.vision_model.encoder.layers
-        for idx in layers:
-            enc[idx - 1].register_forward_hook(self._make_hook(idx))
+        hidden_dim = self.clip.config.vision_config.hidden_size  # 768 for ViT-B/16
 
-        self.register_buffer("mean", torch.tensor([0.481, 0.457, 0.408]).view(1, 3, 1, 1))
-        self.register_buffer("std", torch.tensor([0.268, 0.261, 0.275]).view(1, 3, 1, 1))
-
-    def _make_hook(self, idx):
-        def hook(module, inp, out):
-            self._feats[idx] = out[0] if isinstance(out, (tuple, list)) else out
-        return hook
-
-    def _prep(self, x01):
-        x = F.interpolate(x01, size=(224, 224), mode="bilinear", align_corners=False)
-        return (x - self.mean) / self.std
-
-    def forward(self, x01):
-        x = self._prep(x01)
-        self._feats.clear()
-        self.clip.vision_model(pixel_values=x)            # triggers hooks
-        feats = []
-        for idx, proj in zip(self.layers, self.projs):
-            h = self._feats[idx][:, 1:, :]                # drop CLS -> [B,196,768]
-            h = h.transpose(1, 2).contiguous().view(h.shape[0], 768, 14, 14)
-            feats.append(proj(h))
-        return torch.cat(feats, dim=1)                    # [B, proj_ch*3, 14, 14]
-
-    @torch.no_grad()
-    def global_latent(self, x01):
-        """512-d normalized CLIP image embedding — handy for the sequence predictor."""
-        x = self._prep(x01)
-
-        feat = self.clip.get_image_features(pixel_values=x)
-
-        # Robustly handle different HuggingFace CLIP return types
-        if not torch.is_tensor(feat):
-            if hasattr(feat, "image_embeds") and feat.image_embeds is not None:
-                feat = feat.image_embeds
-            elif hasattr(feat, "pooler_output") and feat.pooler_output is not None:
-                feat = feat.pooler_output
-            elif hasattr(feat, "last_hidden_state") and feat.last_hidden_state is not None:
-                feat = feat.last_hidden_state[:, 0]
-            else:
-                raise TypeError(f"Unsupported CLIP output type: {type(feat)}")
-
-        return F.normalize(feat, dim=-1)
-
-
-# =========================================================
-# The Denoiser U-Net (predicts eps)
-# =========================================================
-
-class CLIPDiffusionUNet(nn.Module):
-    def __init__(self, base=64, time_dim=256, clip_layers=(4, 8, 12),
-                 clip_proj=128, use_clip=True, clip_module=None):
-        super().__init__()
-        self.use_clip = use_clip
-
-        self.time_mlp = nn.Sequential(
-            SinusoidalPosEmb(base),
-            nn.Linear(base, time_dim),
-            nn.SiLU(),
-            nn.Linear(time_dim, time_dim),
+        # Global latent projection
+        self.global_projection = nn.Sequential(
+            nn.Linear(hidden_dim, 512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Linear(512, latent_dim),
+            nn.LayerNorm(latent_dim),
         )
 
-        clip_ch = 0
-        if use_clip:
-            self.clip = clip_module if clip_module is not None else \
-                CLIPMultiScale(clip_layers, clip_proj)
-            clip_ch = self.clip.out_ch
+        # Compress low/mid/high CLIP features into one spatial latent
+        self.low_proj = nn.Sequential(
+            nn.Conv2d(hidden_dim, spatial_dim // 4, kernel_size=1),
+            nn.GroupNorm(8, spatial_dim // 4),
+            nn.GELU(),
+        )
 
-        b = base
-        # ---- encoder (conv path produces real spatial skips) ----
-        self.init = nn.Conv2d(3, b, 3, padding=1)        # 224, b
-        self.rb1  = ResBlock(b, b, time_dim)             # 224, b      -> s0
-        self.down1 = Down(b)                             # -> 112
-        self.rb2  = ResBlock(b, b * 2, time_dim)         # 112, 2b     -> s1
-        self.down2 = Down(b * 2)                         # -> 56
-        self.rb3  = ResBlock(b * 2, b * 4, time_dim)     # 56, 4b      -> s2
-        self.down3 = Down(b * 4)                         # -> 28
-        self.rb4  = ResBlock(b * 4, b * 4, time_dim)     # 28, 4b      -> s3
-        self.down4 = Down(b * 4)                         # -> 14
-        self.rb5  = ResBlock(b * 4, b * 8, time_dim)     # 14, 8b      -> s4
+        self.mid_proj = nn.Sequential(
+            nn.Conv2d(hidden_dim, spatial_dim // 4, kernel_size=1),
+            nn.GroupNorm(8, spatial_dim // 4),
+            nn.GELU(),
+        )
 
-        # ---- bottleneck: fuse CLIP semantic features ----
-        self.fuse = nn.Conv2d(b * 8 + clip_ch, b * 8, 1)
-        self.mid1 = ResBlock(b * 8, b * 8, time_dim)
-        self.attn = AttentionBlock(b * 8)
-        self.mid2 = ResBlock(b * 8, b * 8, time_dim)
+        self.high_proj = nn.Sequential(
+            nn.Conv2d(hidden_dim, spatial_dim // 2, kernel_size=1),
+            nn.GroupNorm(8, spatial_dim // 2),
+            nn.GELU(),
+        )
 
-        # ---- decoder (upsample + skip concat) ----
-        self.up4  = Up(b * 8)                            # 14 -> 28
-        self.urb4 = ResBlock(b * 8 + b * 4, b * 4, time_dim)
-        self.up3  = Up(b * 4)                            # 28 -> 56
-        self.urb3 = ResBlock(b * 4 + b * 4, b * 4, time_dim)
-        self.up2  = Up(b * 4)                            # 56 -> 112
-        self.urb2 = ResBlock(b * 4 + b * 2, b * 2, time_dim)
-        self.up1  = Up(b * 2)                            # 112 -> 224
-        self.urb1 = ResBlock(b * 2 + b, b, time_dim)
+        self.spatial_fusion = nn.Sequential(
+            nn.Conv2d(spatial_dim, spatial_dim, kernel_size=3, padding=1),
+            nn.GroupNorm(8, spatial_dim),
+            nn.GELU(),
+            ResidualBlock(spatial_dim),
+        )
 
-        self.out_norm = gn(b)
-        self.out = nn.Conv2d(b, 3, 3, padding=1)
-        self.act = nn.SiLU()
+        self.register_buffer(
+            "clip_mean",
+            torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1),
+        )
 
-    def forward(self, x, t, cond_feat=None):
-        """x: noisy image in [-1, 1], t: long [B]. Returns predicted noise.
+        self.register_buffer(
+            "clip_std",
+            torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1),
+        )
 
-        cond_feat: optional external CLIP condition [B, clip_ch, 14, 14]. If given
-        (or set via self._external_cond), it REPLACES the features normally computed
-        from x. This is what lets the predictor drive generation; weights unchanged.
+    def _preprocess(self, x):
         """
-        temb = self.time_mlp(t)
-
-        cfeat = None
-        if self.use_clip:
-            if cond_feat is None:
-                cond_feat = getattr(self, "_external_cond", None)
-            if cond_feat is not None:
-                cfeat = cond_feat                                   # <-- use the external condition
-            else:
-                x01 = (x.clamp(-1, 1) + 1) * 0.5
-                cfeat = self.clip(x01)
-
-        h0 = self.init(x)
-        s0 = self.rb1(h0, temb)
-        s1 = self.rb2(self.down1(s0), temb)
-        s2 = self.rb3(self.down2(s1), temb)
-        s3 = self.rb4(self.down3(s2), temb)
-        s4 = self.rb5(self.down4(s3), temb)              # 14x14, 8b
-
-        if self.use_clip:
-            s4 = self.fuse(torch.cat([s4, cfeat], dim=1))
-        else:
-            s4 = self.fuse(s4)
-
-        h = self.mid1(s4, temb)
-        h = self.attn(h)
-        h = self.mid2(h, temb)
-
-        h = self.urb4(torch.cat([self.up4(h), s3], 1), temb)
-        h = self.urb3(torch.cat([self.up3(h), s2], 1), temb)
-        h = self.urb2(torch.cat([self.up2(h), s1], 1), temb)
-        h = self.urb1(torch.cat([self.up1(h), s0], 1), temb)
-
-        return self.out(self.act(self.out_norm(h)))
-# =========================================================
-# Gaussian Diffusion (forward noising + reverse sampling)
-# =========================================================
-
-def cosine_beta_schedule(timesteps, s=0.008):
-    steps = timesteps + 1
-    x = torch.linspace(0, timesteps, steps)
-    ac = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
-    ac = ac / ac[0]
-    betas = 1 - (ac[1:] / ac[:-1])
-    return torch.clip(betas, 1e-4, 0.999)
-
-
-class GaussianDiffusion:
-    def __init__(self, model, timesteps=1000, device="cuda"):
-        self.model = model
-        self.T = timesteps
-        self.device = device
-
-        betas = cosine_beta_schedule(timesteps).to(device)
-        alphas = 1.0 - betas
-        ac = torch.cumprod(alphas, dim=0)
-        ac_prev = F.pad(ac[:-1], (1, 0), value=1.0)
-
-        self.betas = betas
-        self.alphas_cumprod = ac
-        self.sqrt_ac = torch.sqrt(ac)
-        self.sqrt_one_minus_ac = torch.sqrt(1 - ac)
-        self.sqrt_recip_alphas = torch.sqrt(1.0 / alphas)
-        self.posterior_var = betas * (1 - ac_prev) / (1 - ac)
-
-    # ---- forward process q(x_t | x_0) ----
-    def q_sample(self, x0, t, noise=None):
-        if noise is None:
-            noise = torch.randn_like(x0)
-        return (extract(self.sqrt_ac, t, x0.shape) * x0 +
-                extract(self.sqrt_one_minus_ac, t, x0.shape) * noise)
-
-    # ---- training objective (predict eps) ----
-    def p_losses(self, x0, t, noise=None):
-        if noise is None:
-            noise = torch.randn_like(x0)
-        x_t = self.q_sample(x0, t, noise)
-        pred = self.model(x_t, t)
-        loss = F.mse_loss(pred, noise)
-        # recover predicted x0 for logging / viz
-        with torch.no_grad():
-            x0_hat = (x_t - extract(self.sqrt_one_minus_ac, t, x0.shape) * pred) \
-                     / extract(self.sqrt_ac, t, x0.shape)
-        return loss, x0_hat
-
-    # ---- single reverse step ----
-    @torch.no_grad()
-    def p_sample(self, x_t, t):
-        eps = self.model(x_t, t)
-        mean = extract(self.sqrt_recip_alphas, t, x_t.shape) * (
-            x_t - extract(self.betas, t, x_t.shape) /
-            extract(self.sqrt_one_minus_ac, t, x_t.shape) * eps
+        x expected in [0, 1].
+        """
+        x = F.interpolate(
+            x,
+            size=(224, 224),
+            mode="bilinear",
+            align_corners=False,
         )
-        if (t == 0).all():
-            return mean
-        var = extract(self.posterior_var, t, x_t.shape)
-        return mean + torch.sqrt(var) * torch.randn_like(x_t)
 
-    # ---- full reverse loop, optionally starting partway ----
-    @torch.no_grad()
-    def sample(self, shape=None, x_start=None, t_start=None):
-        if x_start is None:
-            x = torch.randn(shape, device=self.device)
-            t_start = self.T
-        else:
-            x = x_start
-            t_start = t_start if t_start is not None else self.T
-        for i in reversed(range(t_start)):
-            t = torch.full((x.shape[0],), i, device=self.device, dtype=torch.long)
-            x = self.p_sample(x, t)
+        return (x - self.clip_mean) / self.clip_std
+
+    def _hidden_to_map(self, h):
+        """
+        h: [B, 197, 768]
+        returns: [B, 768, 14, 14]
+        """
+        h = h[:, 1:, :]  # remove CLS token
+        b, n, c = h.shape
+        side = int(n ** 0.5)
+        return h.transpose(1, 2).contiguous().view(b, c, side, side)
+
+    def forward(self, x, return_raw=False):
+        """
+        x: image in [0, 1]
+        """
+        x_clip = self._preprocess(x)
+
+        vision_outputs = self.clip.vision_model(
+            pixel_values=x_clip,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+
+        # Global latent
+        z = self.global_projection(vision_outputs.pooler_output)
+
+        # Multi-scale CLIP hidden states
+        low_feat = self._hidden_to_map(vision_outputs.hidden_states[3])
+        mid_feat = self._hidden_to_map(vision_outputs.hidden_states[6])
+        high_feat = self._hidden_to_map(vision_outputs.hidden_states[9])
+
+        low = self.low_proj(low_feat)
+        mid = self.mid_proj(mid_feat)
+        high = self.high_proj(high_feat)
+
+        spatial = torch.cat([low, mid, high], dim=1)
+        spatial = self.spatial_fusion(spatial)
+
+        if return_raw:
+            return z, spatial, low_feat, mid_feat, high_feat
+
+        return z, spatial
+
+
+# =========================================================
+# Decoder
+# =========================================================
+
+class VisualDecoder(nn.Module):
+    """
+    Decoder for sequence prediction.
+
+    It reconstructs from:
+
+        z       [B, latent_dim]
+        spatial [B, spatial_dim, 14, 14]
+
+    This means the sequence predictor only needs to predict z and spatial.
+    It does not need raw CLIP low/mid/high features.
+
+    NOTE: the 4-stage transposed-conv stack hard-codes 14 -> 224. `output_size`
+    is retained for API compatibility but only 224 is supported by this stack;
+    it is asserted rather than silently ignored.
+    """
+
+    def __init__(
+        self,
+        latent_dim=128,
+        spatial_dim=256,
+        base_dim=256,
+        output_size=224,
+    ):
+        super().__init__()
+
+        assert output_size == 224, (
+            "VisualDecoder upsampling stack only reaches 224x224; "
+            f"got output_size={output_size}."
+        )
+
+        self.latent_dim = latent_dim
+        self.spatial_dim = spatial_dim
+        self.base_dim = base_dim
+        self.output_size = output_size
+
+        # Global latent -> 14x14 feature map
+        self.fc = nn.Sequential(
+            nn.Linear(latent_dim, base_dim * 14 * 14),
+            nn.GELU(),
+        )
+
+        # Fuse global map and spatial latent
+        self.initial_fusion = nn.Sequential(
+            nn.Conv2d(base_dim + spatial_dim, base_dim, kernel_size=3, padding=1),
+            nn.GroupNorm(8, base_dim),
+            nn.GELU(),
+            ResidualBlock(base_dim),
+        )
+
+        # 14 -> 28
+        self.up1 = nn.Sequential(
+            nn.ConvTranspose2d(base_dim, 128, 4, 2, 1),
+            nn.GroupNorm(8, 128),
+            nn.GELU(),
+            ResidualBlock(128),
+        )
+
+        # 28 -> 56
+        self.up2 = nn.Sequential(
+            nn.ConvTranspose2d(128, 64, 4, 2, 1),
+            nn.GroupNorm(8, 64),
+            nn.GELU(),
+            ResidualBlock(64),
+        )
+
+        # 56 -> 112
+        self.up3 = nn.Sequential(
+            nn.ConvTranspose2d(64, 32, 4, 2, 1),
+            nn.GroupNorm(8, 32),
+            nn.GELU(),
+            ResidualBlock(32),
+        )
+
+        # 112 -> 224
+        self.up4 = nn.Sequential(
+            nn.ConvTranspose2d(32, 16, 4, 2, 1),
+            nn.GroupNorm(8, 16),
+            nn.GELU(),
+            ResidualBlock(16),
+        )
+
+        self.final = nn.Sequential(
+            nn.Conv2d(16, 3, 3, padding=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, z, spatial):
+        b = z.size(0)
+
+        global_map = self.fc(z).view(b, self.base_dim, 14, 14)
+
+        x = torch.cat([global_map, spatial], dim=1)
+        x = self.initial_fusion(x)
+
+        x = self.up1(x)
+        x = self.up2(x)
+        x = self.up3(x)
+        x = self.up4(x)
+
+        x = self.final(x)
+
         return x
 
+
+# =========================================================
+# Visual Autoencoder
+# =========================================================
+
+class VisualAutoencoder(nn.Module):
+    """
+    Sequence-ready visual autoencoder.
+
+    Main methods:
+
+    forward(x):
+        image reconstruction (injects latent noise while training)
+
+    encode(x):
+        returns z, spatial
+
+    decode(z, spatial, add_noise=None):
+        reconstructs image from (possibly predicted) latents
+
+    Latent-noise robustness
+    ------------------------
+    `z_noise_std` and `spatial_noise_std` add Gaussian noise to the latents
+    *before decoding*, scaled per-sample by the latent's own std. This is
+    active ONLY in training mode, so:
+      - your already-converged eval-time decode is unchanged;
+      - a short fine-tune with noise on hardens the decoder against the
+        approximate latents the SequencePredictor produces, which is the
+        single biggest robustness win for the 5th-frame prediction task.
+    Set both to 0.0 to recover the original behaviour exactly.
+    """
+
+    def __init__(
+        self,
+        latent_dim=128,
+        spatial_dim=256,
+        unfreeze_layers=2,
+        z_noise_std=0.05,
+        spatial_noise_std=0.10,
+    ):
+        super().__init__()
+
+        self.encoder = CLIPEncoderWrapper(
+            latent_dim=latent_dim,
+            spatial_dim=spatial_dim,
+            unfreeze_layers=unfreeze_layers,
+        )
+
+        self.decoder = VisualDecoder(
+            latent_dim=latent_dim,
+            spatial_dim=spatial_dim,
+        )
+
+        # Robustness knobs (non-parametric; not in state_dict)
+        self.z_noise_std = z_noise_std
+        self.spatial_noise_std = spatial_noise_std
+
+    # ----- latent noise -----
+    def _maybe_noise(self, x, std):
+        """
+        Add std-relative Gaussian noise (training only). Scaling by the
+        per-sample std keeps the perturbation sensible for both the 128-dim
+        z and the ~50k-dim spatial tensor without separate tuning.
+        """
+        if std <= 0.0 or not self.training:
+            return x
+        dims = tuple(range(1, x.dim()))
+        scale = x.detach().std(dim=dims, keepdim=True).clamp_min(1e-6)
+        return x + torch.randn_like(x) * std * scale
+
+    # ----- core API -----
+    def encode(self, x):
+        """
+        x: image in [0, 1]
+
+        returns:
+            z       [B, latent_dim]
+            spatial [B, spatial_dim, 14, 14]
+        """
+        return self.encoder(x)
+
+    def decode(self, z, spatial, add_noise=None):
+        """
+        Decode from latents.
+
+        add_noise:
+            None  -> follow self.training (noise while training, clean in eval)
+            True  -> force noise
+            False -> force clean (use this when rendering predicted frames)
+        """
+        if add_noise is None:
+            add_noise = self.training
+        if add_noise:
+            z = self._maybe_noise(z, self.z_noise_std)
+            spatial = self._maybe_noise(spatial, self.spatial_noise_std)
+        return self.decoder(z, spatial)
+
+    def forward(self, x):
+        z, spatial = self.encode(x)
+        x_hat = self.decode(z, spatial)  # noise applied iff training
+        return x_hat
+
+    # ----- predictor-facing helpers -----
+    @torch.no_grad()
+    def global_latent(self, x):
+        """
+        Convenience method for sequence predictor (no grad — logging/inference).
+        """
+        z, _ = self.encode(x)
+        return z
+
+    def encode_global(self, x):
+        """
+        Same as global_latent but keeps gradients, for end-to-end
+        predictor training paths.
+        """
+        z, _ = self.encode(x)
+        return z
+
+    def freeze_decoder(self):
+        """
+        Freeze the decoder so the SequencePredictor can be trained by decoding
+        its predicted latent and applying a pixel + perceptual loss in image
+        space (the recommended way to make latent errors tolerable).
+        """
+        for p in self.decoder.parameters():
+            p.requires_grad = False
+        self.decoder.eval()
+        return self
+
+    @torch.no_grad()
+    def latent_usage(self, x):
+        """
+        Diagnostic for posterior-collapse on z. Decodes with z zeroed and with
+        spatial zeroed; if drop_z_l1 is tiny, the decoder barely uses z and the
+        predictor's effort on z is largely wasted.
+        """
+        was_training = self.training
+        self.eval()
+        z, spatial = self.encode(x)
+        full = self.decode(z, spatial, add_noise=False)
+        no_z = self.decode(torch.zeros_like(z), spatial, add_noise=False)
+        no_sp = self.decode(z, torch.zeros_like(spatial), add_noise=False)
+        if was_training:
+            self.train()
+        return {
+            "drop_z_l1": F.l1_loss(no_z, full).item(),
+            "drop_spatial_l1": F.l1_loss(no_sp, full).item(),
+        }
+
+
+# =========================================================
+# Perceptual Loss (multi-layer)
+# =========================================================
+
+class PerceptualLoss(nn.Module):
+    """
+    Multi-layer VGG16 perceptual loss (relu1_2, relu2_2, relu3_3).
+    Frozen and forced to stay in eval() even under .train() so it never
+    drifts. No trainable params.
+    """
+
+    # vgg16.features indices for relu1_2 / relu2_2 / relu3_3
+    DEFAULT_LAYER_IDS = (3, 8, 15)
+
+    def __init__(self, layer_ids=DEFAULT_LAYER_IDS, layer_weights=None):
+        super().__init__()
+
+        vgg = models.vgg16(
+            weights=models.VGG16_Weights.IMAGENET1K_FEATURES
+        ).features
+
+        self.blocks = nn.ModuleList()
+        prev = 0
+        for idx in layer_ids:
+            self.blocks.append(nn.Sequential(*[vgg[i] for i in range(prev, idx + 1)]))
+            prev = idx + 1
+
+        for p in self.parameters():
+            p.requires_grad = False
+        self.eval()
+
+        if layer_weights is None:
+            layer_weights = [1.0] * len(self.blocks)
+        self.layer_weights = layer_weights
+
+        self.register_buffer(
+            "mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+        )
+
+        self.register_buffer(
+            "std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+        )
+
+    def train(self, mode=True):
+        # Keep VGG frozen/eval regardless of parent .train() calls.
+        return super().train(False)
+
+    def _norm(self, x):
+        return (x - self.mean) / self.std
+
+    def forward(self, pred, target):
+        p = self._norm(pred)
+        t = self._norm(target)
+
+        loss = 0.0
+        for blk, w in zip(self.blocks, self.layer_weights):
+            p = blk(p)
+            t = blk(t)
+            loss = loss + w * F.l1_loss(p, t)
+
+        return loss
+
+
+# =========================================================
+# Combined Reconstruction Loss
+# =========================================================
+
+class ReconstructionLoss(nn.Module):
+    """
+    Image-space loss (pixel + perceptual) plus an optional latent-matching
+    term used when training the SequencePredictor against target latents.
+
+    Latent term changes vs original:
+      - z and spatial now have separate weights (they live on very different
+        scales / importance);
+      - z uses cosine distance by default (global CLIP-style codes behave
+        better under cosine than raw MSE). Set z_distance="mse" to revert.
+    """
+
+    def __init__(
+        self,
+        pixel_weight=0.6,
+        perceptual_weight=0.3,
+        latent_weight=0.1,
+        z_weight=1.0,
+        spatial_weight=1.0,
+        z_distance="cosine",  # "cosine" | "mse"
+    ):
+        super().__init__()
+
+        self.pixel_weight = pixel_weight
+        self.perceptual_weight = perceptual_weight
+        self.latent_weight = latent_weight
+        self.z_weight = z_weight
+        self.spatial_weight = spatial_weight
+        assert z_distance in ("cosine", "mse")
+        self.z_distance = z_distance
+
+        self.perceptual = PerceptualLoss()
+
+    def _z_loss(self, z_pred, z_target):
+        if self.z_distance == "cosine":
+            return 1.0 - F.cosine_similarity(z_pred, z_target, dim=-1).mean()
+        return F.mse_loss(z_pred, z_target)
+
+    def forward(
+        self,
+        pred,
+        target,
+        z_pred=None,
+        z_target=None,
+        spatial_pred=None,
+        spatial_target=None,
+    ):
+        pixel_loss = (
+            0.5 * F.mse_loss(pred, target)
+            + 0.5 * F.l1_loss(pred, target)
+        )
+
+        perceptual_loss = self.perceptual(pred, target)
+
+        total = (
+            self.pixel_weight * pixel_loss
+            + self.perceptual_weight * perceptual_loss
+        )
+
+        latent_loss = torch.tensor(0.0, device=pred.device)
+
+        if z_pred is not None and z_target is not None:
+            latent_loss = latent_loss + self.z_weight * self._z_loss(z_pred, z_target)
+
+        if spatial_pred is not None and spatial_target is not None:
+            latent_loss = latent_loss + self.spatial_weight * F.mse_loss(
+                spatial_pred, spatial_target
+            )
+
+        total = total + self.latent_weight * latent_loss
+
+        return total

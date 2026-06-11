@@ -1,4 +1,6 @@
-import numpy as np
+import math
+import textwrap
+
 import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
@@ -8,165 +10,117 @@ GEN_SIZE = 224
 
 
 # =========================================================
-# Batch unpacking
+# Batch helpers
 # =========================================================
 
 def _unpack(batch):
-    """
-    Your current dataloader returns a list/tuple of items.
-    The text dictionary is one of those items.
-
-    Expected text_dict keys:
-        enc_input_ids
-        enc_attention_mask
-        target_ids
-        target_attention_mask
-    """
-    frames = batch[0]
-    image_target = batch[1]
+    frames = batch[0]          # [B, 4, 3, H, W]
+    image_target = batch[1]    # [B, 3, H, W]
     text_dict = next(x for x in batch if isinstance(x, dict))
-
     return frames, image_target, text_dict
 
 
 def _get_text_tensors(text_dict, device):
-    """
-    Handles your current tokenizer dictionary format.
-    """
     enc_ids = text_dict["enc_input_ids"].to(device)
     enc_mask = text_dict["enc_attention_mask"].to(device)
     tgt_ids = text_dict["target_ids"].to(device)
     tgt_mask = text_dict["target_attention_mask"].to(device)
-
     return enc_ids, enc_mask, tgt_ids, tgt_mask
 
 
-def _make_dummy_decoder_input(batch_size, dec_tokenizer, device):
-    """
-    Creates a one-token decoder input so the predictor can run
-    when we only need condition/attention outputs.
-    """
-    start_id = dec_tokenizer.bos_token_id
-
-    if start_id is None:
-        start_id = dec_tokenizer.eos_token_id
-
-    if start_id is None:
-        start_id = dec_tokenizer.pad_token_id
-
-    if start_id is None:
-        raise ValueError("Decoder tokenizer has no bos/eos/pad token id.")
-
-    dummy_ids = torch.full(
-        (batch_size, 1),
-        start_id,
-        dtype=torch.long,
-        device=device,
-    )
-
-    dummy_mask = torch.ones_like(dummy_ids)
-
-    return dummy_ids, dummy_mask
+def _decoder_inputs(target_ids, target_mask):
+    return target_ids[:, :-1], target_mask[:, :-1]
 
 
 # =========================================================
-# DDIM pure-noise generation
+# Metrics
 # =========================================================
 
-@torch.no_grad()
-def generate_frames_ddim_cond(
-    diffusion,
-    pred_cond,
-    image_size=GEN_SIZE,
-    steps=100,
-    eta=0.0,
-):
-    """
-    Pure-noise DDIM generation using external condition.
+def psnr_from_mse(mse):
+    return 10.0 * math.log10(1.0 / max(mse, 1e-8))
 
-    This is the correct path after external-condition fine-tuning:
 
-        random noise + predicted condition -> generated next frame
+def ssim_torch(pred, target):
+    pred = pred.clamp(0, 1)
+    target = target.clamp(0, 1)
 
-    It does NOT use frame 4.
-    """
-    diffusion.model.eval()
+    c1 = 0.01 ** 2
+    c2 = 0.03 ** 2
 
-    device = pred_cond.device
-    B = pred_cond.size(0)
+    mu_x = F.avg_pool2d(pred, 3, 1, 1)
+    mu_y = F.avg_pool2d(target, 3, 1, 1)
 
-    x = torch.randn(
-        B,
-        3,
-        image_size,
-        image_size,
-        device=device,
+    sigma_x = F.avg_pool2d(pred * pred, 3, 1, 1) - mu_x ** 2
+    sigma_y = F.avg_pool2d(target * target, 3, 1, 1) - mu_y ** 2
+    sigma_xy = F.avg_pool2d(pred * target, 3, 1, 1) - mu_x * mu_y
+
+    ssim = ((2 * mu_x * mu_y + c1) * (2 * sigma_xy + c2)) / (
+        (mu_x ** 2 + mu_y ** 2 + c1) * (sigma_x + sigma_y + c2)
     )
 
-    times = torch.linspace(
-        diffusion.T - 1,
-        0,
-        steps,
-        device=device,
-    ).long()
+    return ssim.mean()
 
-    for i in range(len(times)):
-        t_int = int(times[i].item())
 
-        if i == len(times) - 1:
-            prev_t_int = -1
+def rouge_l_score(pred, ref):
+    p = pred.lower().split()
+    r = ref.lower().split()
+
+    if not p or not r:
+        return 0.0
+
+    dp = [[0] * (len(r) + 1) for _ in range(len(p) + 1)]
+
+    for i in range(len(p)):
+        for j in range(len(r)):
+            dp[i + 1][j + 1] = (
+                dp[i][j] + 1
+                if p[i] == r[j]
+                else max(dp[i][j + 1], dp[i + 1][j])
+            )
+
+    lcs = dp[-1][-1]
+    precision = lcs / len(p)
+    recall = lcs / len(r)
+
+    if precision + recall == 0:
+        return 0.0
+
+    return 2 * precision * recall / (precision + recall)
+
+
+def text_metrics(pred_texts, target_texts):
+    try:
+        from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+        smooth = SmoothingFunction().method1
+
+        bleu = [
+            sentence_bleu([t.split()], p.split(), smoothing_function=smooth)
+            for p, t in zip(pred_texts, target_texts)
+        ]
+    except Exception:
+        bleu = [0.0 for _ in pred_texts]
+
+    meteor = []
+
+    for pred, target in zip(pred_texts, target_texts):
+        p_set = set(pred.lower().split())
+        t_set = set(target.lower().split())
+        overlap = len(p_set & t_set)
+
+        if overlap == 0:
+            meteor.append(0.0)
         else:
-            prev_t_int = int(times[i + 1].item())
+            precision = overlap / max(len(p_set), 1)
+            recall = overlap / max(len(t_set), 1)
+            meteor.append((10 * precision * recall) / max(recall + 9 * precision, 1e-8))
 
-        t = torch.full(
-            (B,),
-            t_int,
-            device=device,
-            dtype=torch.long,
-        )
+    rouge = [rouge_l_score(p, t) for p, t in zip(pred_texts, target_texts)]
 
-        eps = diffusion.model(
-            x,
-            t,
-            cond_feat=pred_cond,
-        )
-
-        alpha_t = diffusion.alphas_cumprod[t_int].to(device)
-
-        if prev_t_int >= 0:
-            alpha_prev = diffusion.alphas_cumprod[prev_t_int].to(device)
-        else:
-            alpha_prev = torch.tensor(1.0, device=device)
-
-        sqrt_alpha_t = torch.sqrt(alpha_t)
-        sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
-
-        x0_pred = (
-            x - sqrt_one_minus_alpha_t * eps
-        ) / sqrt_alpha_t.clamp(min=1e-8)
-
-        x0_pred = x0_pred.clamp(-1, 1)
-
-        if prev_t_int < 0:
-            x = x0_pred
-        else:
-            if eta == 0.0:
-                sigma = 0.0
-            else:
-                sigma = eta * torch.sqrt(
-                    (1 - alpha_prev) / (1 - alpha_t)
-                    * (1 - alpha_t / alpha_prev)
-                )
-
-            direction = torch.sqrt(
-                torch.clamp(1 - alpha_prev - sigma ** 2, min=0.0)
-            ) * eps
-
-            noise = torch.randn_like(x) if eta > 0 else 0.0
-
-            x = torch.sqrt(alpha_prev) * x0_pred + direction + sigma * noise
-
-    return (x.clamp(-1, 1) + 1) / 2
+    return {
+        "bleu": sum(bleu) / max(len(bleu), 1),
+        "meteor": sum(meteor) / max(len(meteor), 1),
+        "rougeL": sum(rouge) / max(len(rouge), 1),
+    }
 
 
 # =========================================================
@@ -183,131 +137,303 @@ def generate_text(
     device,
     max_len=80,
 ):
-    """
-    Greedy GPT-2 decode conditioned on predictor's predicted text memory.
-    Compatible with predictor.forward(..., target_ids, target_mask).
-    """
     predictor.eval()
 
-    B = image_seq.size(0)
-
-    start_id = dec_tokenizer.bos_token_id
-
-    if start_id is None:
-        start_id = dec_tokenizer.eos_token_id
-
-    if start_id is None:
-        start_id = dec_tokenizer.pad_token_id
-
-    if start_id is None:
-        raise ValueError("Decoder tokenizer has no bos/eos/pad token id.")
-
-    ids = torch.full(
-        (B, 1),
-        start_id,
-        dtype=torch.long,
-        device=device,
+    gen_ids = predictor.generate_text_ids(
+        image_seq=image_seq.to(device),
+        input_ids_text_encoder=enc_ids.to(device),
+        attention_mask_text_encoder=enc_mask.to(device),
+        max_new_tokens=max_len,
     )
 
-    dummy_tgt_mask = torch.ones_like(ids)
-
-    out = predictor(
-        image_seq,
-        enc_ids,
-        enc_mask,
-        ids,
-        dummy_tgt_mask,
-    )
-
-    mem = out["text_memory"]
-
-    eos_id = dec_tokenizer.eos_token_id
-    finished = torch.zeros(B, dtype=torch.bool, device=device)
-
-    for _ in range(max_len):
-        attn = torch.ones_like(ids)
-
-        dec_out = predictor.text_decoder(
-            input_ids=ids,
-            attention_mask=attn,
-            encoder_hidden_states=mem,
-        )
-
-        next_id = dec_out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-
-        ids = torch.cat([ids, next_id], dim=1)
-
-        if eos_id is not None:
-            finished = finished | (next_id.squeeze(1) == eos_id)
-
-            if bool(finished.all()):
-                break
-
-    return [
-        dec_tokenizer.decode(ids[b, 1:], skip_special_tokens=True)
-        for b in range(B)
-    ]
+    return dec_tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
 
 
 # =========================================================
-# 1. Temporal attention over the T input frames
+# Batch prediction
+# =========================================================
+
+@torch.no_grad()
+def predict_batch(
+    predictor,
+    batch,
+    device,
+    max_new_tokens=80,
+):
+    predictor.eval()
+
+    frames, image_target, text_dict = _unpack(batch)
+
+    frames = frames.to(device)
+    image_target = image_target.to(device)
+
+    enc_ids, enc_mask, target_ids, target_mask = _get_text_tensors(text_dict, device)
+    decoder_ids, decoder_mask = _decoder_inputs(target_ids, target_mask)
+
+    out = predictor(
+        image_seq=frames,
+        input_ids_text_encoder=enc_ids,
+        attention_mask_text_encoder=enc_mask,
+        target_seq_text_decoder=decoder_ids,
+        target_attention_mask_text_decoder=decoder_mask,
+        image_target=image_target,
+        decode_image=True,
+    )
+
+    gen_ids = predictor.generate_text_ids(
+        image_seq=frames,
+        input_ids_text_encoder=enc_ids,
+        attention_mask_text_encoder=enc_mask,
+        max_new_tokens=max_new_tokens,
+    )
+
+    out["generated_text_ids"] = gen_ids
+    out["image_seq"] = frames
+    out["image_target"] = image_target
+    out["target_ids"] = target_ids
+    out["target_attention_mask"] = target_mask
+    out["enc_ids"] = enc_ids
+    out["enc_mask"] = enc_mask
+
+    return out
+
+
+# =========================================================
+# Shape / sanity test
+# =========================================================
+
+@torch.no_grad()
+def test_predictor_shapes(
+    predictor,
+    dataloader,
+    device,
+):
+    batch = next(iter(dataloader))
+    out = predict_batch(predictor, batch, device)
+
+    frames = out["image_seq"]
+    target = out["image_target"]
+
+    assert frames.dim() == 5, f"Expected image_seq [B,4,3,H,W], got {frames.shape}"
+    assert frames.size(1) == 4, f"Expected 4 context frames, got {frames.size(1)}"
+
+    assert out["pred_image"].shape == target.shape
+    assert out["pred_image_z"].dim() == 2
+    assert out["pred_image_spatial"].dim() == 4
+    assert out["pred_text_logits"].dim() == 3
+
+    assert out["visual_attn_weights"].shape[:2] == frames.shape[:2]
+    assert out["text_attn_weights"].shape[:2] == frames.shape[:2]
+
+    print("Shape test passed.")
+    print("pred_image:", tuple(out["pred_image"].shape))
+    print("pred_image_z:", tuple(out["pred_image_z"].shape))
+    print("pred_image_spatial:", tuple(out["pred_image_spatial"].shape))
+    print("pred_text_logits:", tuple(out["pred_text_logits"].shape))
+
+
+# =========================================================
+# Frame-4 copy diagnostic
+# =========================================================
+
+@torch.no_grad()
+def frame4_copy_diagnostic(
+    predictor,
+    dataloader,
+    device,
+    num_batches=5,
+):
+    predictor.eval()
+
+    pred_target_dist = []
+    pred_last_dist = []
+    target_last_dist = []
+    last_attn = []
+
+    for i, batch in enumerate(dataloader):
+        if i >= num_batches:
+            break
+
+        out = predict_batch(predictor, batch, device)
+
+        pred = out["pred_image"].flatten(start_dim=1)
+        target = out["image_target"].flatten(start_dim=1)
+        last = out["image_seq"][:, -1].flatten(start_dim=1)
+
+        pred_target_dist.append(F.mse_loss(pred, target).item())
+        pred_last_dist.append(F.mse_loss(pred, last).item())
+        target_last_dist.append(F.mse_loss(target, last).item())
+
+        last_attn.append(out["visual_attn_weights"][:, -1].mean().item())
+
+    result = {
+        "pred_to_target_mse": sum(pred_target_dist) / max(len(pred_target_dist), 1),
+        "pred_to_frame4_mse": sum(pred_last_dist) / max(len(pred_last_dist), 1),
+        "target_to_frame4_mse": sum(target_last_dist) / max(len(target_last_dist), 1),
+        "mean_visual_attention_on_frame4": sum(last_attn) / max(len(last_attn), 1),
+    }
+
+    print("Frame-4 copy diagnostic:")
+    for k, v in result.items():
+        print(f"  {k}: {v:.6f}")
+
+    if result["mean_visual_attention_on_frame4"] > 0.70:
+        print("Warning: visual attention is heavily concentrated on frame 4.")
+
+    if result["pred_to_frame4_mse"] < result["pred_to_target_mse"]:
+        print("Warning: prediction is closer to frame 4 than to target frame 5.")
+
+    return result
+
+
+# =========================================================
+# Evaluation
+# =========================================================
+
+@torch.no_grad()
+def evaluate_predictor_test(
+    predictor,
+    dataloader,
+    dec_tokenizer,
+    device,
+    reconstruction_loss=None,
+    lpips_model=None,
+    max_batches=None,
+):
+    predictor.eval()
+
+    totals = {
+        "loss": 0.0,
+        "text_loss": 0.0,
+        "image_loss": 0.0,
+        "mse": 0.0,
+        "psnr": 0.0,
+        "ssim": 0.0,
+        "lpips": 0.0,
+    }
+
+    pred_texts = []
+    target_texts = []
+    n = 0
+
+    for i, batch in enumerate(dataloader):
+        if max_batches is not None and i >= max_batches:
+            break
+
+        out = predict_batch(predictor, batch, device)
+
+        image_loss = F.mse_loss(out["pred_image"], out["image_target"])
+
+        if reconstruction_loss is not None:
+            image_loss = reconstruction_loss(
+                out["pred_image"],
+                out["image_target"],
+                z_pred=out["pred_image_z"],
+                z_target=out["target_image_z"],
+                spatial_pred=out["pred_image_spatial"],
+                spatial_target=out["target_image_spatial"],
+            )
+
+        labels = out["target_ids"][:, 1:].clone()
+        labels[out["target_attention_mask"][:, 1:] == 0] = -100
+
+        text_loss = F.cross_entropy(
+            out["pred_text_logits"].reshape(-1, out["pred_text_logits"].size(-1)),
+            labels.reshape(-1),
+            ignore_index=-100,
+        )
+
+        loss = image_loss + text_loss
+
+        mse = F.mse_loss(out["pred_image"], out["image_target"]).item()
+
+        totals["loss"] += loss.item()
+        totals["text_loss"] += text_loss.item()
+        totals["image_loss"] += image_loss.item()
+        totals["mse"] += mse
+        totals["psnr"] += psnr_from_mse(mse)
+        totals["ssim"] += ssim_torch(out["pred_image"], out["image_target"]).item()
+
+        if lpips_model is not None:
+            lp = lpips_model(
+                out["pred_image"] * 2 - 1,
+                out["image_target"] * 2 - 1,
+            ).mean().item()
+            totals["lpips"] += lp
+
+        pred_texts += dec_tokenizer.batch_decode(
+            out["generated_text_ids"],
+            skip_special_tokens=True,
+        )
+
+        target_texts += dec_tokenizer.batch_decode(
+            out["target_ids"],
+            skip_special_tokens=True,
+        )
+
+        n += 1
+
+    for k in totals:
+        totals[k] /= max(n, 1)
+
+    if lpips_model is None:
+        totals["lpips"] = None
+
+    totals.update(text_metrics(pred_texts, target_texts))
+
+    print("Predictor test metrics:")
+    for k, v in totals.items():
+        if v is None:
+            print(f"  {k}: unavailable")
+        else:
+            print(f"  {k}: {v:.4f}")
+
+    return totals
+
+
+# =========================================================
+# Attention visualization
 # =========================================================
 
 @torch.no_grad()
 def plot_temporal_attention(
     predictor,
     dataloader,
-    dec_tokenizer,
     device,
     max_samples=8,
 ):
-    """
-    Plots visual/text temporal attention over the input frames.
-    """
     predictor.eval()
 
     batch = next(iter(dataloader))
-    frames, _, text_dict = _unpack(batch)
+    out = predict_batch(predictor, batch, device)
 
-    frames = frames.to(device)
-    enc_ids, enc_mask, _, _ = _get_text_tensors(text_dict, device)
+    items = [
+        ("Visual", out["visual_attn_weights"]),
+        ("Text", out["text_attn_weights"]),
+    ]
 
-    dummy_ids, dummy_mask = _make_dummy_decoder_input(
-        batch_size=frames.size(0),
-        dec_tokenizer=dec_tokenizer,
-        device=device,
-    )
+    if "fusion_attn_weights" in out:
+        items.append(("Fusion", out["fusion_attn_weights"]))
 
-    out = predictor(
-        frames,
-        enc_ids,
-        enc_mask,
-        dummy_ids,
-        dummy_mask,
-    )
+    n = min(max_samples, out["visual_attn_weights"].size(0))
 
-    v = out["visual_attn_weights"].detach().cpu().numpy()
-    t = out["text_attn_weights"].detach().cpu().numpy()
+    fig, axes = plt.subplots(1, len(items), figsize=(5 * len(items), 0.6 * n + 3))
 
-    n = min(max_samples, v.shape[0])
-    T = v.shape[1]
+    if len(items) == 1:
+        axes = [axes]
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 0.5 * n + 2))
+    for ax, (title, weights) in zip(axes, items):
+        mat = weights[:n].detach().cpu().numpy()
 
-    for ax, mat, title in [
-        (axes[0], v[:n], "Visual"),
-        (axes[1], t[:n], "Text"),
-    ]:
         im = ax.imshow(mat, cmap="viridis", aspect="auto")
-        ax.set_title(f"{title} attention over input frames")
-        ax.set_xlabel("input frame index")
-        ax.set_ylabel("sample")
-        ax.set_xticks(range(T))
-
-        plt.colorbar(im, ax=ax, fraction=0.046)
+        ax.set_title(f"{title} attention")
+        ax.set_xlabel("Input frame/story")
+        ax.set_ylabel("Sample")
+        ax.set_xticks(range(mat.shape[1]))
+        ax.set_xticklabels([str(i + 1) for i in range(mat.shape[1])])
 
         for i in range(mat.shape[0]):
-            for j in range(T):
+            for j in range(mat.shape[1]):
                 ax.text(
                     j,
                     i,
@@ -318,142 +444,7 @@ def plot_temporal_attention(
                     fontsize=7,
                 )
 
-    plt.tight_layout()
-    plt.show()
-    plt.close(fig)
-
-    plt.figure(figsize=(7, 3))
-
-    width = 0.4
-    x = np.arange(T)
-
-    plt.bar(x - width / 2, v.mean(0), width, label="visual")
-    plt.bar(x + width / 2, t.mean(0), width, label="text")
-
-    plt.xticks(x, [f"frame {i + 1}" for i in range(T)])
-    plt.ylabel("mean attention")
-    plt.title("Average temporal attention")
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-    plt.close()
-
-
-# =========================================================
-# 2. CLIP patch-attention overlay on an input frame
-# =========================================================
-
-@torch.no_grad()
-def plot_clip_attention(
-    predictor,
-    dataloader,
-    device,
-    layer_id=-1,
-    head=None,
-    alpha=0.6,
-    frame_index=0,
-):
-    """
-    Plots CLIP ViT patch attention overlay for one input frame.
-
-    Uses predictor.visual_clip.clip.vision_model attentions.
-    """
-    predictor.eval()
-
-    visual_clip = predictor.visual_clip
-    clip_model = visual_clip.clip
-
-    try:
-        clip_model.vision_model.config._attn_implementation = "eager"
-    except Exception:
-        pass
-
-    batch = next(iter(dataloader))
-    frames, _, _ = _unpack(batch)
-
-    img01 = frames[0, frame_index].to(device)
-
-    x = F.interpolate(
-        img01.unsqueeze(0),
-        size=(224, 224),
-        mode="bilinear",
-        align_corners=False,
-    )
-
-    # Prefer your visual encoder's own preprocessing if available.
-    if hasattr(visual_clip, "_prep"):
-        x_norm = visual_clip._prep(x)
-    else:
-        mean = torch.tensor(
-            [0.48145466, 0.4578275, 0.40821073],
-            device=device,
-        ).view(1, 3, 1, 1)
-
-        std = torch.tensor(
-            [0.26862954, 0.26130258, 0.27577711],
-            device=device,
-        ).view(1, 3, 1, 1)
-
-        x_norm = (x - mean) / std
-
-    vis = clip_model.vision_model(
-        pixel_values=x_norm,
-        output_attentions=True,
-        return_dict=True,
-    )
-
-    if vis.attentions is None:
-        raise RuntimeError(
-            "CLIP did not return attentions. Make sure output_attentions=True works "
-            "for your installed transformers version."
-        )
-
-    attn = vis.attentions[layer_id][0]  # [heads, tokens, tokens]
-
-    if head is None:
-        attn = attn.mean(0)
-        head_label = "avg heads"
-    else:
-        attn = attn[head]
-        head_label = f"head {head}"
-
-    cls_to_patches = attn[0, 1:]
-
-    grid_size = int(np.sqrt(cls_to_patches.shape[0]))
-
-    if grid_size * grid_size != cls_to_patches.shape[0]:
-        raise ValueError(
-            f"Patch count {cls_to_patches.shape[0]} is not a square number."
-        )
-
-    heat = cls_to_patches.reshape(grid_size, grid_size)
-
-    heat = F.interpolate(
-        heat[None, None],
-        size=(224, 224),
-        mode="bilinear",
-        align_corners=False,
-    )[0, 0]
-
-    heat = (heat - heat.min()) / (heat.max() - heat.min() + 1e-8)
-    heat = heat.detach().cpu().numpy()
-
-    base = x[0].detach().cpu().permute(1, 2, 0).numpy().clip(0, 1)
-
-    fig, ax = plt.subplots(1, 3, figsize=(15, 5))
-
-    ax[0].imshow(base)
-    ax[0].set_title(f"input frame {frame_index + 1}")
-    ax[0].axis("off")
-
-    ax[1].imshow(heat, cmap="jet")
-    ax[1].set_title(f"CLIP attention\nlayer {layer_id}, {head_label}")
-    ax[1].axis("off")
-
-    ax[2].imshow(base)
-    ax[2].imshow(heat, cmap="jet", alpha=alpha)
-    ax[2].set_title("overlay")
-    ax[2].axis("off")
+        plt.colorbar(im, ax=ax, fraction=0.046)
 
     plt.tight_layout()
     plt.show()
@@ -461,224 +452,86 @@ def plot_clip_attention(
 
 
 # =========================================================
-# 3. Cross-modal alignment
+# Qualitative visualization
 # =========================================================
 
 @torch.no_grad()
-def plot_cross_modal_alignment(
+def visualize_predictions(
     predictor,
     dataloader,
+    enc_tokenizer,
     dec_tokenizer,
     device,
+    max_samples=3,
+    max_new_tokens=80,
 ):
-    """
-    Plots cosine similarity between pooled visual and text features.
-    """
     predictor.eval()
 
     batch = next(iter(dataloader))
-    frames, _, text_dict = _unpack(batch)
-
-    frames = frames.to(device)
-    enc_ids, enc_mask, _, _ = _get_text_tensors(text_dict, device)
-
-    dummy_ids, dummy_mask = _make_dummy_decoder_input(
-        batch_size=frames.size(0),
-        dec_tokenizer=dec_tokenizer,
-        device=device,
+    out = predict_batch(
+        predictor,
+        batch,
+        device,
+        max_new_tokens=max_new_tokens,
     )
 
-    out = predictor(
-        frames,
-        enc_ids,
-        enc_mask,
-        dummy_ids,
-        dummy_mask,
+    pred_texts = dec_tokenizer.batch_decode(
+        out["generated_text_ids"],
+        skip_special_tokens=True,
     )
 
-    zi = F.normalize(out["v_pool"], dim=-1)
-    zt = F.normalize(out["t_pool"], dim=-1)
-
-    sim = (zi @ zt.t()).detach().cpu().numpy()
-
-    plt.figure(figsize=(7, 6))
-
-    im = plt.imshow(sim, cmap="coolwarm", vmin=-1, vmax=1)
-
-    plt.colorbar(im, label="cosine similarity")
-    plt.title("Cross-modal alignment: visual rows vs text columns")
-    plt.xlabel("text sample")
-    plt.ylabel("visual sample")
-
-    plt.tight_layout()
-    plt.show()
-    plt.close()
-
-
-# =========================================================
-# 4. Predicted-frame figures + error map + text
-# =========================================================
-
-@torch.no_grad()
-def show_predictions(
-    predictor,
-    diffusion,
-    dataloader,
-    dec_tokenizer,
-    device,
-    n=3,
-    ddim_steps=100,
-    max_text_len=80,
-    show_true_cond=True,
-):
-    """
-    Shows test predictions.
-
-    For each sample:
-        input frames
-        true next frame
-        DDIM pure noise + PRED condition
-        optional DDIM pure noise + TRUE condition
-        error map
-        GT text and predicted text
-
-    No frame-4 generation is used.
-    """
-    predictor.eval()
-    diffusion.model.eval()
-
-    batch = next(iter(dataloader))
-
-    frames, image_target, text_dict = _unpack(batch)
-
-    frames = frames.to(device)
-    image_target = image_target.to(device)
-
-    enc_ids, enc_mask, tgt_ids, tgt_mask = _get_text_tensors(text_dict, device)
-
-    n = min(n, frames.size(0))
-
-    frames_n = frames[:n]
-    image_target_n = image_target[:n]
-    enc_ids_n = enc_ids[:n]
-    enc_mask_n = enc_mask[:n]
-    tgt_ids_n = tgt_ids[:n]
-    tgt_mask_n = tgt_mask[:n]
-
-    out = predictor(
-        frames_n,
-        enc_ids_n,
-        enc_mask_n,
-        tgt_ids_n,
-        tgt_mask_n,
+    target_texts = dec_tokenizer.batch_decode(
+        out["target_ids"],
+        skip_special_tokens=True,
     )
 
-    pred_cond = out["pred_image_cond"]
+    n = min(max_samples, out["image_seq"].size(0))
 
-    pred_frames = generate_frames_ddim_cond(
-        diffusion=diffusion,
-        pred_cond=pred_cond,
-        image_size=GEN_SIZE,
-        steps=ddim_steps,
-        eta=0.0,
-    )
+    for b in range(n):
+        fig, axes = plt.subplots(1, 6, figsize=(18, 4))
 
-    true_frames = None
+        for t in range(4):
+            axes[t].imshow(
+                out["image_seq"][b, t].detach().cpu().permute(1, 2, 0).clamp(0, 1)
+            )
+            axes[t].set_title(f"Input frame {t + 1}")
+            axes[t].axis("off")
 
-    if show_true_cond:
-        true_cond = predictor.target_image_cond(image_target_n)
+        axes[4].imshow(
+            out["image_target"][b].detach().cpu().permute(1, 2, 0).clamp(0, 1)
+        )
+        axes[4].set_title("Target frame 5")
+        axes[4].axis("off")
 
-        true_frames = generate_frames_ddim_cond(
-            diffusion=diffusion,
-            pred_cond=true_cond,
-            image_size=GEN_SIZE,
-            steps=ddim_steps,
-            eta=0.0,
+        axes[5].imshow(
+            out["pred_image"][b].detach().cpu().permute(1, 2, 0).clamp(0, 1)
+        )
+        axes[5].set_title("Predicted frame 5")
+        axes[5].axis("off")
+
+        input_texts = [
+            enc_tokenizer.decode(
+                out["enc_ids"][b, t],
+                skip_special_tokens=True,
+            )
+            for t in range(4)
+        ]
+
+        text_block = "\n".join(
+            [
+                f"Input {i + 1}: {textwrap.shorten(txt, width=130)}"
+                for i, txt in enumerate(input_texts)
+            ]
         )
 
-    pred_texts = generate_text(
-        predictor=predictor,
-        image_seq=frames_n,
-        enc_ids=enc_ids_n,
-        enc_mask=enc_mask_n,
-        dec_tokenizer=dec_tokenizer,
-        device=device,
-        max_len=max_text_len,
-    )
+        text_block += "\n\n"
+        text_block += "Target 5: " + textwrap.shorten(target_texts[b], width=170)
+        text_block += "\n"
+        text_block += "Predicted 5: " + textwrap.shorten(pred_texts[b], width=170)
 
-    T = frames.size(1)
-
-    for i in range(n):
-        gt_img = F.interpolate(
-            image_target_n[i:i + 1],
-            size=(GEN_SIZE, GEN_SIZE),
-            mode="bilinear",
-            align_corners=False,
-        )[0]
-
-        pred_img = pred_frames[i]
-
-        gt_np = gt_img.detach().cpu().permute(1, 2, 0).numpy().clip(0, 1)
-        pred_np = pred_img.detach().cpu().permute(1, 2, 0).numpy().clip(0, 1)
-
-        err = np.abs(gt_np - pred_np).mean(axis=2)
-
-        extra_cols = 4 if show_true_cond else 3
-
-        fig, axes = plt.subplots(
-            1,
-            T + extra_cols,
-            figsize=(3 * (T + extra_cols), 3),
-        )
-
-        for f in range(T):
-            img = frames_n[i, f].detach().cpu().permute(1, 2, 0).numpy().clip(0, 1)
-
-            axes[f].imshow(img)
-            axes[f].set_title(f"input {f + 1}")
-            axes[f].axis("off")
-
-        target_col = T
-        pred_col = T + 1
-
-        axes[target_col].imshow(gt_np)
-        axes[target_col].set_title("true next")
-        axes[target_col].axis("off")
-
-        axes[pred_col].imshow(pred_np)
-        axes[pred_col].set_title(f"DDIM pred\n{ddim_steps} steps")
-        axes[pred_col].axis("off")
-
-        if show_true_cond:
-            true_col = T + 2
-            error_col = T + 3
-
-            true_np = true_frames[i].detach().cpu().permute(1, 2, 0).numpy().clip(0, 1)
-
-            axes[true_col].imshow(true_np)
-            axes[true_col].set_title("DDIM true cond\nupper bound")
-            axes[true_col].axis("off")
-        else:
-            error_col = T + 2
-
-        im = axes[error_col].imshow(err, cmap="hot")
-        axes[error_col].set_title("error map")
-        axes[error_col].axis("off")
-
-        plt.colorbar(im, ax=axes[error_col], fraction=0.046)
+        fig.suptitle(f"Prediction sample {b + 1}", fontsize=14)
+        fig.text(0.01, -0.05, text_block, fontsize=10, va="top")
 
         plt.tight_layout()
         plt.show()
         plt.close(fig)
-
-        gt_text = dec_tokenizer.decode(
-            tgt_ids_n[i],
-            skip_special_tokens=True,
-        )
-
-        print(f"--- sample {i} ---")
-        print("GT text:")
-        print(gt_text)
-        print("\nPredicted text:")
-        print(pred_texts[i])
-        print()
