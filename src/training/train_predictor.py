@@ -139,7 +139,133 @@ def text_metrics(pred_texts, target_texts):
         "meteor": sum(meteor) / max(len(meteor), 1),
         "rougeL": sum(rouge) / max(len(rouge), 1),
     }
+def next_token_ce_loss(logits, target_ids, target_attention_mask):
+    """
+    Computes GPT-2 next-token cross entropy.
 
+    logits:
+        [B, S-1, vocab], produced from decoder input target_ids[:, :-1]
+
+    target_ids:
+        [B, S]
+
+    target_attention_mask:
+        [B, S]
+    """
+    labels = target_ids[:, 1:].clone()
+    labels[target_attention_mask[:, 1:] == 0] = -100
+
+    return F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        labels.reshape(-1),
+        ignore_index=-100,
+    )
+
+
+def attention_anti_collapse_loss(
+    out,
+    last_frame_cap=0.55,
+    min_entropy_frac=0.65,
+):
+    """
+    Penalizes attention collapse onto only the 4th frame/story.
+
+    If frame 4 gets more than last_frame_cap attention, we add a small penalty.
+    Entropy penalty prevents all attention going to one frame.
+    """
+    losses = []
+    device = out["pred_image_z"].device
+
+    for key in [
+        "visual_attn_weights",
+        "text_attn_weights",
+        "fusion_attn_weights",
+    ]:
+        weights = out.get(key, None)
+
+        if weights is None:
+            continue
+
+        weights = weights.clamp_min(1e-8)
+
+        last_weight = weights[:, -1]
+        last_penalty = F.relu(last_weight - last_frame_cap).pow(2).mean()
+
+        entropy = -(weights * weights.log()).sum(dim=-1)
+        max_entropy = math.log(weights.size(1))
+        entropy_floor = min_entropy_frac * max_entropy
+
+        entropy_penalty = F.relu(entropy_floor - entropy).pow(2).mean()
+
+        losses.append(last_penalty + 0.25 * entropy_penalty)
+
+    if not losses:
+        return torch.tensor(0.0, device=device)
+
+    return torch.stack(losses).mean()
+
+
+def _anti_copy_margin_loss(
+    pred,
+    target,
+    last_input,
+    margin_ratio=0.20,
+    min_target_change=1e-5,
+):
+    """
+    Requires prediction to be closer to true frame/story 5 than copied frame 4.
+
+    Active only when target is meaningfully different from frame 4.
+    """
+    pred = pred.flatten(start_dim=1)
+    target = target.flatten(start_dim=1)
+    last_input = last_input.flatten(start_dim=1)
+
+    d_pred_target = F.mse_loss(pred, target, reduction="none").mean(dim=1)
+    d_pred_last = F.mse_loss(pred, last_input, reduction="none").mean(dim=1)
+    d_target_last = F.mse_loss(target, last_input, reduction="none").mean(dim=1)
+
+    active = (d_target_last.detach() > min_target_change).float()
+    margin = margin_ratio * d_target_last.detach()
+
+    loss = F.relu(d_pred_target - d_pred_last + margin)
+
+    return (loss * active).sum() / active.sum().clamp_min(1.0)
+
+
+def anti_frame4_copy_loss(out, image_seq, image_target):
+    """
+    Penalizes copying frame 4 instead of predicting frame 5.
+
+    Uses image-space, global-latent, and spatial-latent checks.
+    """
+    last_image = image_seq[:, -1]
+
+    image_copy_loss = _anti_copy_margin_loss(
+        pred=out["pred_image"],
+        target=image_target,
+        last_input=last_image,
+        margin_ratio=0.20,
+        min_target_change=1e-4,
+    )
+
+    z_copy_loss = _anti_copy_margin_loss(
+        pred=out["pred_image_z"],
+        target=out["target_image_z"],
+        last_input=out["input_visual_z"][:, -1],
+        margin_ratio=0.25,
+        min_target_change=1e-5,
+    )
+
+    spatial_copy_loss = _anti_copy_margin_loss(
+        pred=out["pred_image_spatial"],
+        target=out["target_image_spatial"],
+        last_input=out["input_visual_spatial"][:, -1],
+        margin_ratio=0.15,
+        min_target_change=1e-5,
+    )
+
+    return image_copy_loss + z_copy_loss + 0.25 * spatial_copy_loss
 
 @torch.no_grad()
 def evaluate_predictor(
@@ -336,7 +462,53 @@ def visualize_validation_epoch(
         plt.savefig(path, bbox_inches="tight", dpi=140)
         plt.show()
         plt.close(fig)
+def apply_temporal_context_dropout(
+    image_seq,
+    enc_ids,
+    enc_mask,
+    p_other=0.05,
+    p_last=0.20,
+    image_fill=0.5,
+    pad_token_id=None,
+):
+    """
+    Randomly masks context steps during training.
 
+    The 4th frame/story is masked more often so the predictor cannot learn
+    the shortcut of relying almost entirely on frame/story 4.
+    """
+    if p_other <= 0 and p_last <= 0:
+        return image_seq, enc_ids, enc_mask
+
+    b, t = image_seq.shape[:2]
+    device = image_seq.device
+
+    drop = torch.rand(b, t, device=device) < p_other
+    drop[:, -1] = torch.rand(b, device=device) < p_last
+
+    # Never drop every context step for a sample.
+    all_dropped = drop.all(dim=1)
+    if all_dropped.any():
+        drop[all_dropped, 0] = False
+
+    if not drop.any():
+        return image_seq, enc_ids, enc_mask
+
+    image_seq = image_seq.clone()
+    enc_ids = enc_ids.clone()
+    enc_mask = enc_mask.clone()
+
+    # Replace dropped image context with a neutral gray image.
+    image_seq[drop] = image_fill
+
+    # Hide dropped story context from RoBERTa pooling/attention.
+    enc_mask[drop] = 0
+
+    # Optional: also replace token ids with pad id if available.
+    if pad_token_id is not None:
+        enc_ids[drop] = pad_token_id
+
+    return image_seq, enc_ids, enc_mask
 
 def train_sequence_predictor(
     predictor,
