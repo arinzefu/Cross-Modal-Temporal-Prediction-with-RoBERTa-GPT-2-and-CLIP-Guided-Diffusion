@@ -7,6 +7,8 @@ from tqdm.auto import tqdm
 
 def save_predictor_checkpoint(path, predictor, optimizer, epoch, history, best_val_loss):
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    print(f"Saving checkpoint for epoch {epoch}: {path}")
+
     torch.save({
         "epoch": epoch,
         "model_state_dict": predictor.state_dict(),
@@ -15,22 +17,34 @@ def save_predictor_checkpoint(path, predictor, optimizer, epoch, history, best_v
         "best_val_loss": best_val_loss,
     }, path)
 
+    print(f"Checkpoint saved: {path}")
+
 
 def load_predictor_checkpoint(path, predictor, optimizer=None, device="cpu"):
+    print(f"Looking for checkpoint: {path}")
+
     if not os.path.exists(path):
+        print(f"No checkpoint found at {path}. Starting from scratch.")
         return 1, float("inf"), []
 
+    print(f"Loading checkpoint: {path}")
     ckpt = torch.load(path, map_location=device, weights_only=False)
     predictor.load_state_dict(ckpt["model_state_dict"])
 
     if optimizer is not None and ckpt.get("optimizer_state_dict") is not None:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        print("Optimizer state loaded.")
+    elif optimizer is not None:
+        print("Checkpoint has no optimizer state. Optimizer will start fresh.")
 
     start_epoch = ckpt.get("epoch", 0) + 1
     best_val_loss = ckpt.get("best_val_loss", float("inf"))
     history = ckpt.get("history", [])
 
-    print(f"Loaded checkpoint from epoch {start_epoch - 1}")
+    print(
+        f"Checkpoint loaded. Resuming from epoch {start_epoch}; "
+        f"best_val_loss={best_val_loss:.4f}"
+    )
     return start_epoch, best_val_loss, history
 
 
@@ -48,6 +62,8 @@ def write_metrics_log(path, history):
         writer.writeheader()
         for row in history:
             writer.writerow({k: row.get(k, None) for k in keys})
+
+    print(f"Metrics log saved: {path}")
 
 
 def ssim_torch(pred, target):
@@ -139,19 +155,9 @@ def text_metrics(pred_texts, target_texts):
         "meteor": sum(meteor) / max(len(meteor), 1),
         "rougeL": sum(rouge) / max(len(rouge), 1),
     }
+
+
 def next_token_ce_loss(logits, target_ids, target_attention_mask):
-    """
-    Computes GPT-2 next-token cross entropy.
-
-    logits:
-        [B, S-1, vocab], produced from decoder input target_ids[:, :-1]
-
-    target_ids:
-        [B, S]
-
-    target_attention_mask:
-        [B, S]
-    """
     labels = target_ids[:, 1:].clone()
     labels[target_attention_mask[:, 1:] == 0] = -100
 
@@ -167,12 +173,6 @@ def attention_anti_collapse_loss(
     last_frame_cap=0.55,
     min_entropy_frac=0.65,
 ):
-    """
-    Penalizes attention collapse onto only the 4th frame/story.
-
-    If frame 4 gets more than last_frame_cap attention, we add a small penalty.
-    Entropy penalty prevents all attention going to one frame.
-    """
     losses = []
     device = out["pred_image_z"].device
 
@@ -212,11 +212,6 @@ def _anti_copy_margin_loss(
     margin_ratio=0.20,
     min_target_change=1e-5,
 ):
-    """
-    Requires prediction to be closer to true frame/story 5 than copied frame 4.
-
-    Active only when target is meaningfully different from frame 4.
-    """
     pred = pred.flatten(start_dim=1)
     target = target.flatten(start_dim=1)
     last_input = last_input.flatten(start_dim=1)
@@ -234,11 +229,6 @@ def _anti_copy_margin_loss(
 
 
 def anti_frame4_copy_loss(out, image_seq, image_target):
-    """
-    Penalizes copying frame 4 instead of predicting frame 5.
-
-    Uses image-space, global-latent, and spatial-latent checks.
-    """
     last_image = image_seq[:, -1]
 
     image_copy_loss = _anti_copy_margin_loss(
@@ -266,6 +256,82 @@ def anti_frame4_copy_loss(out, image_seq, image_target):
     )
 
     return image_copy_loss + z_copy_loss + 0.25 * spatial_copy_loss
+
+
+def apply_temporal_context_dropout(
+    image_seq,
+    enc_ids,
+    enc_mask,
+    p_other=0.05,
+    p_last=0.20,
+    image_fill=0.5,
+    pad_token_id=None,
+):
+    if p_other <= 0 and p_last <= 0:
+        return image_seq, enc_ids, enc_mask
+
+    b, t = image_seq.shape[:2]
+    device = image_seq.device
+
+    drop = torch.rand(b, t, device=device) < p_other
+    drop[:, -1] = torch.rand(b, device=device) < p_last
+
+    all_dropped = drop.all(dim=1)
+    if all_dropped.any():
+        drop[all_dropped, 0] = False
+
+    if not drop.any():
+        return image_seq, enc_ids, enc_mask
+
+    image_seq = image_seq.clone()
+    enc_ids = enc_ids.clone()
+    enc_mask = enc_mask.clone()
+
+    image_seq[drop] = image_fill
+    enc_mask[drop] = 0
+
+    if pad_token_id is not None:
+        enc_ids[drop] = pad_token_id
+
+    return image_seq, enc_ids, enc_mask
+
+
+def print_latent_diagnostic(out):
+    z_cos = F.cosine_similarity(
+        out["pred_image_z"],
+        out["target_image_z"],
+        dim=-1,
+    ).mean()
+
+    spatial_mse = F.mse_loss(
+        out["pred_image_spatial"],
+        out["target_image_spatial"],
+    )
+
+    print("\nLatent diagnostic")
+    print(
+        "z pred mean/std:",
+        f"{out['pred_image_z'].mean().item():.4f}",
+        f"{out['pred_image_z'].std().item():.4f}",
+    )
+    print(
+        "z target mean/std:",
+        f"{out['target_image_z'].mean().item():.4f}",
+        f"{out['target_image_z'].std().item():.4f}",
+    )
+    print(
+        "spatial pred mean/std:",
+        f"{out['pred_image_spatial'].mean().item():.4f}",
+        f"{out['pred_image_spatial'].std().item():.4f}",
+    )
+    print(
+        "spatial target mean/std:",
+        f"{out['target_image_spatial'].mean().item():.4f}",
+        f"{out['target_image_spatial'].std().item():.4f}",
+    )
+    print("z cosine:", f"{z_cos.item():.4f}")
+    print("spatial mse:", f"{spatial_mse.item():.4f}")
+
 
 @torch.no_grad()
 def evaluate_predictor(
@@ -315,6 +381,9 @@ def evaluate_predictor(
             image_target=image_target,
             decode_image=True,
         )
+
+        if n == 0:
+            print_latent_diagnostic(out)
 
         image_loss = reconstruction_loss(
             out["pred_image"],
@@ -400,13 +469,14 @@ def visualize_validation_epoch(
     enc_ids = text_dict["enc_input_ids"].to(device)
     enc_mask = text_dict["enc_attention_mask"].to(device)
     target_ids = text_dict["target_ids"].to(device)
+    target_mask = text_dict["target_attention_mask"].to(device)
 
     out = predictor(
         image_seq=image_seq,
         input_ids_text_encoder=enc_ids,
         attention_mask_text_encoder=enc_mask,
         target_seq_text_decoder=target_ids[:, :-1],
-        target_attention_mask_text_decoder=torch.ones_like(target_ids[:, :-1]),
+        target_attention_mask_text_decoder=target_mask[:, :-1],
         image_target=image_target,
         decode_image=True,
     )
@@ -445,8 +515,10 @@ def visualize_validation_epoch(
         ]
 
         text_block = "\n".join(
-            [f"Input {i + 1}: {textwrap.shorten(txt, width=120)}"
-             for i, txt in enumerate(input_texts)]
+            [
+                f"Input {i + 1}: {textwrap.shorten(txt, width=120)}"
+                for i, txt in enumerate(input_texts)
+            ]
         )
 
         text_block += "\n\n"
@@ -460,55 +532,10 @@ def visualize_validation_epoch(
 
         path = os.path.join(save_dir, f"epoch_{epoch:03d}_sample_{b + 1}.png")
         plt.savefig(path, bbox_inches="tight", dpi=140)
+        print(f"Validation visualization saved: {path}")
         plt.show()
         plt.close(fig)
-def apply_temporal_context_dropout(
-    image_seq,
-    enc_ids,
-    enc_mask,
-    p_other=0.05,
-    p_last=0.20,
-    image_fill=0.5,
-    pad_token_id=None,
-):
-    """
-    Randomly masks context steps during training.
 
-    The 4th frame/story is masked more often so the predictor cannot learn
-    the shortcut of relying almost entirely on frame/story 4.
-    """
-    if p_other <= 0 and p_last <= 0:
-        return image_seq, enc_ids, enc_mask
-
-    b, t = image_seq.shape[:2]
-    device = image_seq.device
-
-    drop = torch.rand(b, t, device=device) < p_other
-    drop[:, -1] = torch.rand(b, device=device) < p_last
-
-    # Never drop every context step for a sample.
-    all_dropped = drop.all(dim=1)
-    if all_dropped.any():
-        drop[all_dropped, 0] = False
-
-    if not drop.any():
-        return image_seq, enc_ids, enc_mask
-
-    image_seq = image_seq.clone()
-    enc_ids = enc_ids.clone()
-    enc_mask = enc_mask.clone()
-
-    # Replace dropped image context with a neutral gray image.
-    image_seq[drop] = image_fill
-
-    # Hide dropped story context from RoBERTa pooling/attention.
-    enc_mask[drop] = 0
-
-    # Optional: also replace token ids with pad id if available.
-    if pad_token_id is not None:
-        enc_ids[drop] = pad_token_id
-
-    return image_seq, enc_ids, enc_mask
 
 def train_sequence_predictor(
     predictor,
@@ -529,10 +556,17 @@ def train_sequence_predictor(
     last_frame_cap=0.55,
     use_context_dropout=True,
 ):
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
     ckpt_path = os.path.join(checkpoint_dir, "sequence_predictor_latest.pth")
     best_path = os.path.join(checkpoint_dir, "sequence_predictor_best.pth")
     log_path = os.path.join(checkpoint_dir, "sequence_predictor_metrics.csv")
     viz_dir = os.path.join(checkpoint_dir, "validation_visuals")
+
+    print(f"Checkpoint directory: {checkpoint_dir}")
+    print(f"Latest checkpoint path: {ckpt_path}")
+    print(f"Best checkpoint path: {best_path}")
+    print(f"Metrics log path: {log_path}")
 
     lpips_model = get_lpips_model(device)
 
@@ -541,10 +575,19 @@ def train_sequence_predictor(
             ckpt_path, predictor, optimizer, device
         )
     else:
+        print("resume=False. Starting training from scratch.")
         start_epoch, best_val_loss, history = 1, float("inf"), []
+
+    if start_epoch > epochs:
+        print(
+            f"Checkpoint is already past requested epochs "
+            f"(start_epoch={start_epoch}, epochs={epochs}). Nothing to train."
+        )
+        return history
 
     for epoch in range(start_epoch, epochs + 1):
         predictor.train()
+        print(f"\nStarting epoch {epoch}/{epochs}")
 
         train_loss = train_image_loss = train_text_loss = 0.0
         train_attn_loss = train_copy_loss = 0.0
@@ -570,6 +613,7 @@ def train_sequence_predictor(
                     train_enc_mask,
                     p_other=0.05,
                     p_last=0.20,
+                    pad_token_id=getattr(enc_tokenizer, "pad_token_id", None),
                 )
 
             optimizer.zero_grad(set_to_none=True)
@@ -636,6 +680,7 @@ def train_sequence_predictor(
 
         n_train = max(len(train_loader), 1)
 
+        print(f"Running validation after epoch {epoch}...")
         val_metrics = evaluate_predictor(
             predictor=predictor,
             val_loader=val_loader,
@@ -658,6 +703,7 @@ def train_sequence_predictor(
         history.append(row)
         write_metrics_log(log_path, history)
 
+        # Always save the latest checkpoint after every epoch.
         save_predictor_checkpoint(
             ckpt_path,
             predictor,
@@ -669,6 +715,10 @@ def train_sequence_predictor(
 
         if val_metrics["val_loss"] < best_val_loss:
             best_val_loss = val_metrics["val_loss"]
+            print(
+                f"New best validation loss at epoch {epoch}: "
+                f"{best_val_loss:.4f}"
+            )
             save_predictor_checkpoint(
                 best_path,
                 predictor,
@@ -676,6 +726,11 @@ def train_sequence_predictor(
                 epoch,
                 history,
                 best_val_loss,
+            )
+        else:
+            print(
+                f"No best-checkpoint update. Current val_loss="
+                f"{val_metrics['val_loss']:.4f}, best_val_loss={best_val_loss:.4f}"
             )
 
         visualize_validation_epoch(
@@ -700,5 +755,11 @@ def train_sequence_predictor(
             f"meteor={row['meteor']:.4f} | "
             f"rougeL={row['rougeL']:.4f}"
         )
+
+    print("Training complete.")
+    print(f"Latest checkpoint: {ckpt_path}")
+    print(f"Best checkpoint: {best_path}")
+    print(f"Metrics log: {log_path}")
+    print(f"Validation visualizations: {viz_dir}")
 
     return history
