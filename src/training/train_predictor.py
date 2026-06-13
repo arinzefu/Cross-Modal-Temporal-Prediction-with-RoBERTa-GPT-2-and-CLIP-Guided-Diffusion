@@ -342,6 +342,8 @@ def evaluate_predictor(
     device,
     lpips_model=None,
     max_new_tokens=80,
+    text_weight=1.0,
+    image_weight=1.0
 ):
     predictor.eval()
 
@@ -400,7 +402,7 @@ def evaluate_predictor(
             target_attention_mask=target_mask,
         )
 
-        val_loss = image_loss + text_loss
+        val_loss = image_weight * image_loss + text_weight * text_loss
         mse = F.mse_loss(out["pred_image"], image_target).item()
 
         totals["val_loss"] += val_loss.item()
@@ -688,6 +690,8 @@ def train_sequence_predictor(
             dec_tokenizer=dec_tokenizer,
             device=device,
             lpips_model=lpips_model,
+            text_weight=text_weight,
+            image_weight=image_weight,
         )
 
         row = {
