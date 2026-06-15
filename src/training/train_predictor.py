@@ -1,6 +1,7 @@
 import os, csv, math, textwrap
 import torch
 import torch.nn.functional as F
+from torch.amp import autocast, GradScaler
 import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 
@@ -54,7 +55,7 @@ def write_metrics_log(path, history):
     keys = [
         "epoch", "train_loss", "train_image_loss", "train_text_loss",
         "val_loss", "val_text_loss", "mse", "psnr", "ssim", "lpips",
-        "bleu", "meteor", "rougeL", "attn_loss", "copy_loss",
+        "bleu", "meteor", "rougeL", "attn_loss", "copy_loss", "grad_loss",
     ]
 
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -89,6 +90,21 @@ def ssim_torch(pred, target):
 
 def psnr_from_mse(mse):
     return 10.0 * math.log10(1.0 / max(mse, 1e-8))
+
+
+def image_gradient_loss(pred, target):
+    """
+    L1 difference of horizontal/vertical image gradients.
+
+    Penalises blur directly in pixel space: a smooth/grey prediction has near-zero
+    gradients and is punished against the sharp target. Gradients flow through
+    `pred` (no clamping) so the decoder is pushed toward crisp edges.
+    """
+    p_dx = pred[..., :, 1:] - pred[..., :, :-1]
+    p_dy = pred[..., 1:, :] - pred[..., :-1, :]
+    t_dx = target[..., :, 1:] - target[..., :, :-1]
+    t_dy = target[..., 1:, :] - target[..., :-1, :]
+    return F.l1_loss(p_dx, t_dx) + F.l1_loss(p_dy, t_dy)
 
 
 def get_lpips_model(device):
@@ -296,7 +312,7 @@ def apply_temporal_context_dropout(
     return image_seq, enc_ids, enc_mask
 
 
-def print_latent_diagnostic(out):
+def print_latent_diagnostic(out, predictor=None):
     z_cos = F.cosine_similarity(
         out["pred_image_z"],
         out["target_image_z"],
@@ -307,6 +323,12 @@ def print_latent_diagnostic(out):
         out["pred_image_spatial"],
         out["target_image_spatial"],
     )
+
+    spatial_cos = F.cosine_similarity(
+        out["pred_image_spatial"].flatten(1),
+        out["target_image_spatial"].flatten(1),
+        dim=-1,
+    ).mean()
 
     print("\nLatent diagnostic")
     print(
@@ -330,7 +352,15 @@ def print_latent_diagnostic(out):
         f"{out['target_image_spatial'].std().item():.4f}",
     )
     print("z cosine:", f"{z_cos.item():.4f}")
+    print("spatial cosine:", f"{spatial_cos.item():.4f}")
     print("spatial mse:", f"{spatial_mse.item():.4f}")
+
+    if predictor is not None and getattr(predictor, "predict_residual", False):
+        print(
+            "residual gates  z/spatial:",
+            f"{predictor.z_res_scale.item():.4f}",
+            f"{predictor.spatial_res_scale.item():.4f}",
+        )
 
 
 @torch.no_grad()
@@ -343,7 +373,8 @@ def evaluate_predictor(
     lpips_model=None,
     max_new_tokens=80,
     text_weight=1.0,
-    image_weight=1.0
+    image_weight=1.0,
+    eval_text_max_batches=None,
 ):
     predictor.eval()
 
@@ -385,7 +416,7 @@ def evaluate_predictor(
         )
 
         if n == 0:
-            print_latent_diagnostic(out)
+            print_latent_diagnostic(out, predictor)
 
         image_loss = reconstruction_loss(
             out["pred_image"],
@@ -418,22 +449,27 @@ def evaluate_predictor(
             ).mean().item()
             totals["lpips"] += lp
 
-        gen_ids = predictor.generate_text_ids(
-            image_seq=image_seq,
-            input_ids_text_encoder=enc_ids,
-            attention_mask_text_encoder=enc_mask,
-            max_new_tokens=max_new_tokens,
+        run_text_gen = (
+            eval_text_max_batches is None or n < eval_text_max_batches
         )
 
-        pred_texts_all += dec_tokenizer.batch_decode(
-            gen_ids,
-            skip_special_tokens=True,
-        )
+        if run_text_gen:
+            gen_ids = predictor.generate_text_ids(
+                image_seq=image_seq,
+                input_ids_text_encoder=enc_ids,
+                attention_mask_text_encoder=enc_mask,
+                max_new_tokens=max_new_tokens,
+            )
 
-        target_texts_all += dec_tokenizer.batch_decode(
-            target_ids,
-            skip_special_tokens=True,
-        )
+            pred_texts_all += dec_tokenizer.batch_decode(
+                gen_ids,
+                skip_special_tokens=True,
+            )
+
+            target_texts_all += dec_tokenizer.batch_decode(
+                target_ids,
+                skip_special_tokens=True,
+            )
 
         n += 1
 
@@ -557,8 +593,20 @@ def train_sequence_predictor(
     copy_margin_weight=0.10,
     last_frame_cap=0.55,
     use_context_dropout=True,
+    grad_weight=0.5,
+    use_amp=True,
+    eval_text_max_batches=8,
+    ctx_dropout_p_other=0.05,
+    ctx_dropout_p_last=0.0,
 ):
     os.makedirs(checkpoint_dir, exist_ok=True)
+
+    torch.backends.cudnn.benchmark = True
+
+    amp_device = "cuda" if torch.cuda.is_available() else "cpu"
+    use_amp = use_amp and amp_device == "cuda"
+    scaler = GradScaler(amp_device, enabled=use_amp)
+    print(f"Mixed precision (AMP): {'on' if use_amp else 'off'}")
 
     ckpt_path = os.path.join(checkpoint_dir, "sequence_predictor_latest.pth")
     best_path = os.path.join(checkpoint_dir, "sequence_predictor_best.pth")
@@ -592,7 +640,7 @@ def train_sequence_predictor(
         print(f"\nStarting epoch {epoch}/{epochs}")
 
         train_loss = train_image_loss = train_text_loss = 0.0
-        train_attn_loss = train_copy_loss = 0.0
+        train_attn_loss = train_copy_loss = train_grad_loss = 0.0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}")
 
@@ -613,71 +661,79 @@ def train_sequence_predictor(
                     train_image_seq,
                     train_enc_ids,
                     train_enc_mask,
-                    p_other=0.05,
-                    p_last=0.20,
+                    p_other=ctx_dropout_p_other,
+                    p_last=ctx_dropout_p_last,
                     pad_token_id=getattr(enc_tokenizer, "pad_token_id", None),
                 )
 
             optimizer.zero_grad(set_to_none=True)
 
-            out = predictor(
-                image_seq=train_image_seq,
-                input_ids_text_encoder=train_enc_ids,
-                attention_mask_text_encoder=train_enc_mask,
-                target_seq_text_decoder=target_ids[:, :-1],
-                target_attention_mask_text_decoder=target_mask[:, :-1],
-                image_target=image_target,
-                decode_image=True,
-            )
+            with autocast(amp_device, enabled=use_amp):
+                out = predictor(
+                    image_seq=train_image_seq,
+                    input_ids_text_encoder=train_enc_ids,
+                    attention_mask_text_encoder=train_enc_mask,
+                    target_seq_text_decoder=target_ids[:, :-1],
+                    target_attention_mask_text_decoder=target_mask[:, :-1],
+                    image_target=image_target,
+                    decode_image=True,
+                )
 
-            image_loss = reconstruction_loss(
-                out["pred_image"],
-                image_target,
-                z_pred=out["pred_image_z"],
-                z_target=out["target_image_z"],
-                spatial_pred=out["pred_image_spatial"],
-                spatial_target=out["target_image_spatial"],
-            )
+                image_loss = reconstruction_loss(
+                    out["pred_image"],
+                    image_target,
+                    z_pred=out["pred_image_z"],
+                    z_target=out["target_image_z"],
+                    spatial_pred=out["pred_image_spatial"],
+                    spatial_target=out["target_image_spatial"],
+                )
 
-            text_loss = next_token_ce_loss(
-                out["pred_text_logits"],
-                target_ids,
-                target_mask,
-            )
+                text_loss = next_token_ce_loss(
+                    out["pred_text_logits"],
+                    target_ids,
+                    target_mask,
+                )
 
-            attn_loss = attention_anti_collapse_loss(
-                out,
-                last_frame_cap=last_frame_cap,
-                min_entropy_frac=0.65,
-            )
+                attn_loss = attention_anti_collapse_loss(
+                    out,
+                    last_frame_cap=last_frame_cap,
+                    min_entropy_frac=0.65,
+                )
 
-            copy_loss = anti_frame4_copy_loss(
-                out,
-                image_seq,
-                image_target,
-            )
+                copy_loss = anti_frame4_copy_loss(
+                    out,
+                    image_seq,
+                    image_target,
+                )
 
-            loss = (
-                image_weight * image_loss
-                + text_weight * text_loss
-                + attn_balance_weight * attn_loss
-                + copy_margin_weight * copy_loss
-            )
+                grad_loss = image_gradient_loss(out["pred_image"], image_target)
 
-            loss.backward()
+                loss = (
+                    image_weight * image_loss
+                    + text_weight * text_loss
+                    + attn_balance_weight * attn_loss
+                    + copy_margin_weight * copy_loss
+                    + grad_weight * grad_loss
+                )
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(predictor.parameters(), 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             train_loss += loss.item()
             train_image_loss += image_loss.item()
             train_text_loss += text_loss.item()
             train_attn_loss += attn_loss.item()
             train_copy_loss += copy_loss.item()
+            train_grad_loss += grad_loss.item()
 
             pbar.set_postfix(
                 loss=f"{loss.item():.4f}",
                 text=f"{text_loss.item():.4f}",
                 img=f"{image_loss.item():.4f}",
+                grad=f"{grad_loss.item():.4f}",
             )
 
         n_train = max(len(train_loader), 1)
@@ -692,6 +748,7 @@ def train_sequence_predictor(
             lpips_model=lpips_model,
             text_weight=text_weight,
             image_weight=image_weight,
+            eval_text_max_batches=eval_text_max_batches,
         )
 
         row = {
@@ -701,6 +758,7 @@ def train_sequence_predictor(
             "train_text_loss": train_text_loss / n_train,
             "attn_loss": train_attn_loss / n_train,
             "copy_loss": train_copy_loss / n_train,
+            "grad_loss": train_grad_loss / n_train,
             **val_metrics,
         }
 

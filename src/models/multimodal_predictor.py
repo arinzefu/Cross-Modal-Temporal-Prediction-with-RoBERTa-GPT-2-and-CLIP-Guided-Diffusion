@@ -412,13 +412,14 @@ class SequencePredictor(nn.Module):
         temporal_heads: int = 8,
         cross_attention_heads: int = 8,
         dropout: float = 0.1,
-        text_memory_tokens: int = 4,
+        text_memory_tokens: int = 24,
         expected_context_frames: Optional[int] = 4,
         max_context_frames: int = 8,
         freeze_visual_encoder: bool = True,
         freeze_visual_decoder: bool = True,
         freeze_text_encoder: bool = True,
         train_text_decoder: bool = False,
+        predict_residual: bool = True,
     ):
         super().__init__()
 
@@ -526,12 +527,13 @@ class SequencePredictor(nn.Module):
             dropout=dropout,
         )
 
+        # No trailing LayerNorm: in residual mode this head outputs a *delta*
+        # added to the anchor latent, so it must be free to have a small scale.
         self.z_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, self.visual_latent_dim),
-            nn.LayerNorm(self.visual_latent_dim),
         )
 
         self.spatial_head = SpatialLatentHead(
@@ -541,6 +543,14 @@ class SequencePredictor(nn.Module):
             seed_channels=min(128, hidden_dim),
             dropout=dropout,
         )
+
+        # Residual prediction. Anchor the next-frame latent on the LAST context
+        # frame and predict only the change. The gates start at 0, so the very
+        # first prediction equals the (sharp) frame-4 reconstruction instead of
+        # the blurred conditional mean that collapses to grey.
+        self.predict_residual = predict_residual
+        self.z_res_scale = nn.Parameter(torch.zeros(1))
+        self.spatial_res_scale = nn.Parameter(torch.zeros(1))
 
         self.text_memory_tokens = text_memory_tokens
 
@@ -764,8 +774,21 @@ class SequencePredictor(nn.Module):
 
         next_state = state["next_state"]
 
-        pred_image_z = self.z_head(next_state)
-        pred_image_spatial = self.spatial_head(next_state)
+        z_delta = self.z_head(next_state)
+        spatial_delta = self.spatial_head(next_state)
+
+        if self.predict_residual:
+            # Anchor on the last observed frame's latent and add a learned change.
+            # Even when the change collapses toward its mean, decoding
+            # (sharp anchor + small change) yields a sharp image, not grey mush.
+            last_z = state["input_visual_z"][:, -1]
+            last_spatial = state["input_visual_spatial"][:, -1]
+
+            pred_image_z = last_z + self.z_res_scale * z_delta
+            pred_image_spatial = last_spatial + self.spatial_res_scale * spatial_delta
+        else:
+            pred_image_z = z_delta
+            pred_image_spatial = spatial_delta
 
         pred_image = None
 
@@ -942,6 +965,37 @@ class SequencePredictor(nn.Module):
 
         return None
 
+    @staticmethod
+    def _apply_repetition_penalty(logits, prev_ids, penalty):
+        """HF-style repetition penalty on already-generated tokens."""
+        if penalty is None or penalty == 1.0:
+            return logits
+        for b in range(logits.size(0)):
+            seen = torch.unique(prev_ids[b])
+            vals = logits[b, seen]
+            vals = torch.where(vals > 0, vals / penalty, vals * penalty)
+            logits[b, seen] = vals
+        return logits
+
+    @staticmethod
+    def _block_repeat_ngrams(logits, prev_ids, ngram_size):
+        """Forbid tokens that would complete an n-gram already seen in the output."""
+        if not ngram_size or ngram_size <= 0:
+            return logits
+        seq_len = prev_ids.size(1)
+        if seq_len < ngram_size:
+            return logits
+        for b in range(prev_ids.size(0)):
+            tokens = prev_ids[b].tolist()
+            prefix = tuple(tokens[-(ngram_size - 1):]) if ngram_size > 1 else tuple()
+            banned = set()
+            for i in range(len(tokens) - ngram_size + 1):
+                if tuple(tokens[i:i + ngram_size - 1]) == prefix:
+                    banned.add(tokens[i + ngram_size - 1])
+            if banned:
+                logits[b, list(banned)] = torch.finfo(logits.dtype).min
+        return logits
+
     @torch.no_grad()
     def generate_text_ids(
         self,
@@ -949,6 +1003,8 @@ class SequencePredictor(nn.Module):
         input_ids_text_encoder,
         attention_mask_text_encoder,
         max_new_tokens: int = 80,
+        repetition_penalty: float = 1.3,
+        no_repeat_ngram_size: int = 3,
     ):
         """
         Greedy generation for story 5.
@@ -999,7 +1055,21 @@ class SequencePredictor(nn.Module):
                 return_dict=True,
             )
 
-            next_id = dec_out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            logits = dec_out.logits[:, -1, :].clone()
+            logits = self._apply_repetition_penalty(logits, ids, repetition_penalty)
+            logits = self._block_repeat_ngrams(logits, ids, no_repeat_ngram_size)
+
+            next_id = logits.argmax(dim=-1, keepdim=True)
+
+            if eos_id is not None:
+                # Once a sequence has emitted eos, keep padding with eos so the
+                # decoded string is not corrupted by post-eos tokens.
+                next_id = torch.where(
+                    finished.unsqueeze(1),
+                    torch.full_like(next_id, eos_id),
+                    next_id,
+                )
+
             ids = torch.cat([ids, next_id], dim=1)
 
             if eos_id is not None:
