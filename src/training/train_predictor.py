@@ -312,6 +312,41 @@ def apply_temporal_context_dropout(
     return image_seq, enc_ids, enc_mask
 
 
+def mean_pairwise_cos(x):
+    """
+    Mean cosine similarity between DISTINCT samples in a batch.
+
+    ~1.0  => every sample produced almost the same vector (collapse).
+    lower => samples are distinct (healthy).
+    """
+    v = x.flatten(1).float()
+    v = F.normalize(v, dim=1)
+    sim = v @ v.t()
+    b = v.size(0)
+    if b < 2:
+        return float("nan")
+    eye = torch.eye(b, dtype=torch.bool, device=v.device)
+    return sim[~eye].mean().item()
+
+
+def collapse_report(predictor, out):
+    """
+    Localizes where per-sample signal is lost. Compare each stage to the two
+    *reference* rows (input/target): if next_state collapses while the inputs are
+    distinct, the bug is in the sequence/fusion. If next_state is distinct but the
+    text memory or text output collapses, the bug is in the text head/decoder.
+    """
+    mem = predictor._make_text_memory(out["z_next"])
+
+    print("\nCollapse report  (mean pairwise cosine across samples; ~1.0 == collapsed)")
+    print(f"  input frame-4 z   : {mean_pairwise_cos(out['input_visual_z'][:, -1]):.4f}   <- reference (input distinctness)")
+    print(f"  target frame-5 z  : {mean_pairwise_cos(out['target_image_z']):.4f}   <- reference (target distinctness)")
+    print(f"  next_state        : {mean_pairwise_cos(out['z_next']):.4f}")
+    print(f"  pred z            : {mean_pairwise_cos(out['pred_image_z']):.4f}")
+    print(f"  pred spatial      : {mean_pairwise_cos(out['pred_image_spatial']):.4f}")
+    print(f"  text memory       : {mean_pairwise_cos(mem):.4f}")
+
+
 def print_latent_diagnostic(out, predictor=None):
     z_cos = F.cosine_similarity(
         out["pred_image_z"],
@@ -417,6 +452,7 @@ def evaluate_predictor(
 
         if n == 0:
             print_latent_diagnostic(out, predictor)
+            collapse_report(predictor, out)
 
         image_loss = reconstruction_loss(
             out["pred_image"],
@@ -529,10 +565,27 @@ def visualize_validation_epoch(
     pred_texts = dec_tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
     target_texts = dec_tokenizer.batch_decode(target_ids, skip_special_tokens=True)
 
+    # Decode the TRUE frame-4 (anchor) and frame-5 latents through the predictor's
+    # own decode path. If these are sharp but "Predicted frame 5" is grey, the
+    # decoder is fine and the prediction is the problem. If THESE are grey too,
+    # the predictor's encode/decode path differs from the standalone AE test.
+    z4, sp4 = predictor.target_image_latents(image_seq[:, -1])
+    recon_anchor = predictor.decode_image_latents(z4, sp4)
+    recon_target = predictor.decode_image_latents(
+        out["target_image_z"], out["target_image_spatial"]
+    )
+
     take = min(max_samples, image_seq.size(0))
 
+    if take >= 2:
+        identical = pred_texts[0].strip() == pred_texts[1].strip()
+        print(f"[text] sample-1 vs sample-2 prediction identical: {identical}")
+        if identical:
+            print("[text] -> conditioning collapse: the decoder is ignoring the "
+                  "per-sample memory (check the collapse report above).")
+
     for b in range(take):
-        fig, axes = plt.subplots(1, 6, figsize=(18, 4))
+        fig, axes = plt.subplots(1, 8, figsize=(24, 4))
 
         for t in range(4):
             axes[t].imshow(image_seq[b, t].detach().cpu().permute(1, 2, 0).clamp(0, 1))
@@ -546,6 +599,14 @@ def visualize_validation_epoch(
         axes[5].imshow(out["pred_image"][b].detach().cpu().permute(1, 2, 0).clamp(0, 1))
         axes[5].set_title("Predicted frame 5")
         axes[5].axis("off")
+
+        axes[6].imshow(recon_anchor[b].detach().cpu().permute(1, 2, 0).clamp(0, 1))
+        axes[6].set_title("decode(frame-4 latent)")
+        axes[6].axis("off")
+
+        axes[7].imshow(recon_target[b].detach().cpu().permute(1, 2, 0).clamp(0, 1))
+        axes[7].set_title("decode(frame-5 latent)")
+        axes[7].axis("off")
 
         input_texts = [
             enc_tokenizer.decode(enc_ids[b, t], skip_special_tokens=True)
@@ -598,8 +659,11 @@ def train_sequence_predictor(
     eval_text_max_batches=8,
     ctx_dropout_p_other=0.05,
     ctx_dropout_p_last=0.0,
+    early_stop_patience=None,
 ):
     os.makedirs(checkpoint_dir, exist_ok=True)
+
+    epochs_since_best = 0
 
     torch.backends.cudnn.benchmark = True
 
@@ -777,6 +841,7 @@ def train_sequence_predictor(
 
         if val_metrics["val_loss"] < best_val_loss:
             best_val_loss = val_metrics["val_loss"]
+            epochs_since_best = 0
             print(
                 f"New best validation loss at epoch {epoch}: "
                 f"{best_val_loss:.4f}"
@@ -790,9 +855,11 @@ def train_sequence_predictor(
                 best_val_loss,
             )
         else:
+            epochs_since_best += 1
             print(
                 f"No best-checkpoint update. Current val_loss="
-                f"{val_metrics['val_loss']:.4f}, best_val_loss={best_val_loss:.4f}"
+                f"{val_metrics['val_loss']:.4f}, best_val_loss={best_val_loss:.4f} "
+                f"(epochs since best: {epochs_since_best})"
             )
 
         visualize_validation_epoch(
@@ -817,6 +884,13 @@ def train_sequence_predictor(
             f"meteor={row['meteor']:.4f} | "
             f"rougeL={row['rougeL']:.4f}"
         )
+
+        if early_stop_patience is not None and epochs_since_best >= early_stop_patience:
+            print(
+                f"Early stopping at epoch {epoch}: no val improvement for "
+                f"{early_stop_patience} epochs. Best val_loss={best_val_loss:.4f}."
+            )
+            break
 
     print("Training complete.")
     print(f"Latest checkpoint: {ckpt_path}")

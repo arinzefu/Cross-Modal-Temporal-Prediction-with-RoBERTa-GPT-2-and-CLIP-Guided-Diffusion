@@ -420,6 +420,8 @@ class SequencePredictor(nn.Module):
         freeze_text_encoder: bool = True,
         train_text_decoder: bool = False,
         predict_residual: bool = True,
+        residual_delta: float = 0.15,
+        ground_text_on_inputs: bool = True,
     ):
         super().__init__()
 
@@ -534,6 +536,7 @@ class SequencePredictor(nn.Module):
             nn.GELU(),
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, self.visual_latent_dim),
+            nn.LayerNorm(self.visual_latent_dim),
         )
 
         self.spatial_head = SpatialLatentHead(
@@ -544,13 +547,12 @@ class SequencePredictor(nn.Module):
             dropout=dropout,
         )
 
-        # Residual prediction. Anchor the next-frame latent on the LAST context
-        # frame and predict only the change. The gates start at 0, so the very
-        # first prediction equals the (sharp) frame-4 reconstruction instead of
-        # the blurred conditional mean that collapses to grey.
+        # Residual prediction with a HARD bound. The previous learnable gate let
+        # the head output explode (z std blew up to ~4.5x target), pushing the
+        # latent off the decoder manifold -> grey. A fixed tanh bound keeps the
+        # prediction within +/- residual_delta of the (sharp, on-manifold) anchor.
         self.predict_residual = predict_residual
-        self.z_res_scale = nn.Parameter(torch.zeros(1))
-        self.spatial_res_scale = nn.Parameter(torch.zeros(1))
+        self.residual_delta = residual_delta
 
         self.text_memory_tokens = text_memory_tokens
 
@@ -568,6 +570,13 @@ class SequencePredictor(nn.Module):
         nn.init.trunc_normal_(self.text_memory_pos, std=0.02)
 
         self.text_memory_norm = nn.LayerNorm(self.text_enc_dim)
+
+        # Ground the decoder on the actual input-story token features so it can
+        # copy entities (names, objects) instead of hallucinating from the GPT-2
+        # prior. These raw RoBERTa features match what the decoder cross-attended
+        # to during text-autoencoder pretraining.
+        self.ground_text_on_inputs = ground_text_on_inputs
+        self.text_ground_norm = nn.LayerNorm(self.text_enc_dim)
 
         self.train(True)
 
@@ -647,13 +656,19 @@ class SequencePredictor(nn.Module):
                 return_dict=True,
             )
 
-        token_features = self.text_projector(enc.last_hidden_state)
+        raw_feats = enc.last_hidden_state                 # [B*T, L, text_enc_dim]
+        token_features = self.text_projector(raw_feats)   # [B*T, L, hidden_dim]
 
         mask = flat_mask.unsqueeze(-1).float()
         pooled = (token_features * mask).sum(dim=1)
         pooled = pooled / mask.sum(dim=1).clamp_min(1.0)
+        pooled = pooled.view(b, t, -1)
 
-        return pooled.view(b, t, -1)
+        # Flatten the per-frame token features into one grounding memory bank.
+        ground_feats = raw_feats.reshape(b, t * l, -1)    # [B, T*L, text_enc_dim]
+        ground_mask = flat_mask.reshape(b, t * l)         # [B, T*L]
+
+        return pooled, ground_feats, ground_mask
 
     def _build_next_state(
         self,
@@ -679,7 +694,7 @@ class SequencePredictor(nn.Module):
             visual_tokens + spatial_tokens
         )
 
-        text_tokens = self._encode_text_sequence(
+        text_tokens, text_ground_feats, text_ground_mask = self._encode_text_sequence(
             input_ids_text_encoder,
             attention_mask_text_encoder,
         )
@@ -725,6 +740,8 @@ class SequencePredictor(nn.Module):
             "cross_attn": cross_attn,
             "input_visual_z": z_seq,
             "input_visual_spatial": spatial_seq,
+            "text_ground_feats": text_ground_feats,
+            "text_ground_mask": text_ground_mask,
         }
 
     def _make_text_memory(self, next_state):
@@ -737,6 +754,31 @@ class SequencePredictor(nn.Module):
         mem = self.text_memory_norm(mem)
 
         return mem
+
+    def _decoder_memory(self, next_state, ground_feats=None, ground_mask=None):
+        """
+        Full cross-attention memory the decoder sees:
+        the predicted "next-state" tokens, followed (optionally) by the grounding
+        bank of input-story token features. Returns (memory, attention_mask).
+        """
+        pred_mem = self._make_text_memory(next_state)
+        b = pred_mem.size(0)
+        device = pred_mem.device
+
+        mask = torch.ones(b, pred_mem.size(1), dtype=torch.long, device=device)
+
+        if self.ground_text_on_inputs and ground_feats is not None:
+            ground = self.text_ground_norm(ground_feats)
+            memory = torch.cat([pred_mem, ground], dim=1)
+
+            if ground_mask is None:
+                ground_mask = torch.ones(
+                    b, ground.size(1), dtype=torch.long, device=device
+                )
+            mask = torch.cat([mask, ground_mask.long()], dim=1)
+            return memory, mask
+
+        return pred_mem, mask
 
     def forward(
         self,
@@ -778,14 +820,16 @@ class SequencePredictor(nn.Module):
         spatial_delta = self.spatial_head(next_state)
 
         if self.predict_residual:
-            # Anchor on the last observed frame's latent and add a learned change.
-            # Even when the change collapses toward its mean, decoding
-            # (sharp anchor + small change) yields a sharp image, not grey mush.
+            # Anchor on the last observed frame's latent and add a *bounded* change.
+            # tanh keeps every element of the change in [-residual_delta, +delta],
+            # so the predicted latent never leaves the decoder's manifold.
             last_z = state["input_visual_z"][:, -1]
             last_spatial = state["input_visual_spatial"][:, -1]
 
-            pred_image_z = last_z + self.z_res_scale * z_delta
-            pred_image_spatial = last_spatial + self.spatial_res_scale * spatial_delta
+            pred_image_z = last_z + self.residual_delta * torch.tanh(z_delta)
+            pred_image_spatial = (
+                last_spatial + self.residual_delta * torch.tanh(spatial_delta)
+            )
         else:
             pred_image_z = z_delta
             pred_image_spatial = spatial_delta
@@ -799,18 +843,15 @@ class SequencePredictor(nn.Module):
                 add_noise=False,
             )
 
-        text_memory = self._make_text_memory(next_state)
+        text_memory, encoder_attention_mask = self._decoder_memory(
+            next_state,
+            state.get("text_ground_feats"),
+            state.get("text_ground_mask"),
+        )
 
         pred_text_logits = None
 
         if target_seq_text_decoder is not None:
-            encoder_attention_mask = torch.ones(
-                b,
-                self.text_memory_tokens,
-                dtype=torch.long,
-                device=image_seq.device,
-            )
-
             dec_out = self.text_decoder(
                 input_ids=target_seq_text_decoder,
                 attention_mask=target_attention_mask_text_decoder,
@@ -826,7 +867,7 @@ class SequencePredictor(nn.Module):
             "pred_image_z": pred_image_z,
             "pred_image_spatial": pred_image_spatial,
             "pred_text_logits": pred_text_logits,
-            "text_memory": text_memory,
+            "text_memory": self._make_text_memory(next_state),
             "z_next": next_state,
             "v_pool": state["visual_pool"],
             "t_pool": state["text_pool"],
@@ -1020,7 +1061,11 @@ class SequencePredictor(nn.Module):
             attention_mask_text_encoder=attention_mask_text_encoder,
         )
 
-        text_memory = self._make_text_memory(state["next_state"])
+        text_memory, encoder_attention_mask = self._decoder_memory(
+            state["next_state"],
+            state.get("text_ground_feats"),
+            state.get("text_ground_mask"),
+        )
 
         b = image_seq.size(0)
         device = image_seq.device
@@ -1031,13 +1076,6 @@ class SequencePredictor(nn.Module):
         ids = torch.full(
             (b, 1),
             start_id,
-            dtype=torch.long,
-            device=device,
-        )
-
-        encoder_attention_mask = torch.ones(
-            b,
-            self.text_memory_tokens,
             dtype=torch.long,
             device=device,
         )
