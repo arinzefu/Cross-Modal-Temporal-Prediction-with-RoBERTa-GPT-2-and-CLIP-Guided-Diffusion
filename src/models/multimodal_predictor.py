@@ -422,6 +422,7 @@ class SequencePredictor(nn.Module):
         predict_residual: bool = True,
         residual_delta: float = 0.15,
         ground_text_on_inputs: bool = True,
+        frame_blend: bool = True,
     ):
         super().__init__()
 
@@ -553,6 +554,16 @@ class SequencePredictor(nn.Module):
         # prediction within +/- residual_delta of the (sharp, on-manifold) anchor.
         self.predict_residual = predict_residual
         self.residual_delta = residual_delta
+
+        # Frame-blend anchor: instead of anchoring the prediction on frame 4 alone
+        # (which makes it copy frame 4), predict softmax weights over ALL context
+        # frames and anchor on their weighted blend. A blend of on-manifold frame
+        # latents stays near the manifold (so it decodes sharp), and the output is
+        # a function of all 4 frames. Zero-init -> starts as a uniform average.
+        self.frame_blend = frame_blend
+        self.frame_score = nn.Linear(hidden_dim, 1)
+        nn.init.zeros_(self.frame_score.weight)
+        nn.init.zeros_(self.frame_score.bias)
 
         self.text_memory_tokens = text_memory_tokens
 
@@ -729,6 +740,10 @@ class SequencePredictor(nn.Module):
 
         next_state = self.dynamics_model(last_state, context)
 
+        # Per-frame blend weights over the context frames (softmax over T).
+        frame_scores = self.frame_score(fused_temp).squeeze(-1)   # [B, T]
+        frame_weights = torch.softmax(frame_scores, dim=1)        # [B, T]
+
         return {
             "next_state": next_state,
             "visual_pool": visual_pool,
@@ -742,6 +757,7 @@ class SequencePredictor(nn.Module):
             "input_visual_spatial": spatial_seq,
             "text_ground_feats": text_ground_feats,
             "text_ground_mask": text_ground_mask,
+            "frame_weights": frame_weights,
         }
 
     def _make_text_memory(self, next_state):
@@ -820,15 +836,24 @@ class SequencePredictor(nn.Module):
         spatial_delta = self.spatial_head(next_state)
 
         if self.predict_residual:
-            # Anchor on the last observed frame's latent and add a *bounded* change.
-            # tanh keeps every element of the change in [-residual_delta, +delta],
-            # so the predicted latent never leaves the decoder's manifold.
-            last_z = state["input_visual_z"][:, -1]
-            last_spatial = state["input_visual_spatial"][:, -1]
+            # Anchor on a weighted blend of ALL context frames (not just frame 4),
+            # then add a *bounded* change. tanh keeps the change within
+            # +/- residual_delta, so the latent stays near the (on-manifold) blend.
+            if self.frame_blend:
+                fw = state["frame_weights"]                       # [B, T]
+                anchor_z = torch.einsum(
+                    "bt,btd->bd", fw, state["input_visual_z"]
+                )
+                anchor_spatial = torch.einsum(
+                    "bt,btchw->bchw", fw, state["input_visual_spatial"]
+                )
+            else:
+                anchor_z = state["input_visual_z"][:, -1]
+                anchor_spatial = state["input_visual_spatial"][:, -1]
 
-            pred_image_z = last_z + self.residual_delta * torch.tanh(z_delta)
+            pred_image_z = anchor_z + self.residual_delta * torch.tanh(z_delta)
             pred_image_spatial = (
-                last_spatial + self.residual_delta * torch.tanh(spatial_delta)
+                anchor_spatial + self.residual_delta * torch.tanh(spatial_delta)
             )
         else:
             pred_image_z = z_delta
@@ -878,6 +903,7 @@ class SequencePredictor(nn.Module):
             "cross_attn": state["cross_attn"],
             "input_visual_z": state["input_visual_z"],
             "input_visual_spatial": state["input_visual_spatial"],
+            "frame_weights": state["frame_weights"],
 
             # Compatibility aliases for older training code.
             "pred_image_latent": pred_image_z,

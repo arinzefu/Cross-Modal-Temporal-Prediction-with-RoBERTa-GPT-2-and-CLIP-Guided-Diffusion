@@ -1,4 +1,6 @@
 import math
+import os
+import json
 import textwrap
 
 import torch
@@ -7,6 +9,15 @@ import matplotlib.pyplot as plt
 
 
 GEN_SIZE = 224
+
+
+def _results_dir(save_dir):
+    """Create (save_dir)/test_results and return it, or None if save_dir is None."""
+    if save_dir is None:
+        return None
+    out = os.path.join(save_dir, "test_results")
+    os.makedirs(out, exist_ok=True)
+    return out
 
 
 # =========================================================
@@ -135,7 +146,7 @@ def generate_text(
     enc_mask,
     dec_tokenizer,
     device,
-    max_len=80,
+    max_len=256,
 ):
     predictor.eval()
 
@@ -158,7 +169,7 @@ def predict_batch(
     predictor,
     batch,
     device,
-    max_new_tokens=80,
+    max_new_tokens=256,
 ):
     predictor.eval()
 
@@ -242,6 +253,7 @@ def frame4_copy_diagnostic(
     dataloader,
     device,
     num_batches=5,
+    save_dir=None,
 ):
     predictor.eval()
 
@@ -283,6 +295,11 @@ def frame4_copy_diagnostic(
     if result["pred_to_frame4_mse"] < result["pred_to_target_mse"]:
         print("Warning: prediction is closer to frame 4 than to target frame 5.")
 
+    out_dir = _results_dir(save_dir)
+    if out_dir is not None:
+        with open(os.path.join(out_dir, "frame4_copy_diagnostic.json"), "w") as f:
+            json.dump({k: float(v) for k, v in result.items()}, f, indent=2)
+
     return result
 
 
@@ -299,6 +316,7 @@ def evaluate_predictor_test(
     reconstruction_loss=None,
     lpips_model=None,
     max_batches=None,
+    save_dir=None,
 ):
     predictor.eval()
 
@@ -388,6 +406,64 @@ def evaluate_predictor_test(
         else:
             print(f"  {k}: {v:.4f}")
 
+    out_dir = _results_dir(save_dir)
+
+    # ---- Metrics as bar charts (split by scale so nothing is dwarfed) ----
+    zero_one = [
+        (k, totals[k])
+        for k in ["ssim", "bleu", "meteor", "rougeL", "mse", "lpips"]
+        if totals.get(k) is not None
+    ]
+    magnitude = [
+        (k, totals[k])
+        for k in ["psnr", "loss", "image_loss", "text_loss"]
+        if totals.get(k) is not None
+    ]
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    for ax, group, title in [
+        (axes[0], zero_one, "Quality scores (0-1)"),
+        (axes[1], magnitude, "Magnitude (PSNR dB / losses)"),
+    ]:
+        if not group:
+            ax.axis("off")
+            continue
+        names = [k for k, _ in group]
+        vals = [v for _, v in group]
+        bars = ax.bar(names, vals, color="#4C72B0")
+        ax.set_title(title)
+        ax.tick_params(axis="x", rotation=30)
+        for bar, v in zip(bars, vals):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height(),
+                f"{v:.3f}",
+                ha="center",
+                va="bottom",
+                fontsize=9,
+            )
+
+    fig.suptitle("Predictor test metrics", fontsize=14)
+    plt.tight_layout()
+
+    if out_dir is not None:
+        fig.savefig(os.path.join(out_dir, "metrics_bar.png"),
+                    bbox_inches="tight", dpi=140)
+        # Persist the metrics and the full text pairs alongside the figure.
+        with open(os.path.join(out_dir, "metrics.json"), "w") as f:
+            json.dump({k: (None if v is None else float(v))
+                       for k, v in totals.items()}, f, indent=2)
+        with open(os.path.join(out_dir, "generated_texts.txt"), "w") as f:
+            for i, (p, t) in enumerate(zip(pred_texts, target_texts)):
+                f.write(f"=== sample {i + 1} ===\n")
+                f.write(f"TARGET   : {t}\n")
+                f.write(f"PREDICTED: {p}\n\n")
+        print(f"Saved metrics chart, metrics.json and generated_texts.txt to {out_dir}")
+
+    plt.show()
+    plt.close(fig)
+
     return totals
 
 
@@ -401,6 +477,7 @@ def plot_temporal_attention(
     dataloader,
     device,
     max_samples=8,
+    save_dir=None,
 ):
     predictor.eval()
 
@@ -447,6 +524,13 @@ def plot_temporal_attention(
         plt.colorbar(im, ax=ax, fraction=0.046)
 
     plt.tight_layout()
+
+    out_dir = _results_dir(save_dir)
+    if out_dir is not None:
+        fig.savefig(os.path.join(out_dir, "temporal_attention.png"),
+                    bbox_inches="tight", dpi=140)
+        print(f"Saved temporal_attention.png to {out_dir}")
+
     plt.show()
     plt.close(fig)
 
@@ -464,6 +548,7 @@ def visualize_predictions(
     device,
     max_samples=3,
     max_new_tokens=80,
+    save_dir=None,
 ):
     predictor.eval()
 
@@ -487,6 +572,9 @@ def visualize_predictions(
 
     n = min(max_samples, out["image_seq"].size(0))
 
+    out_dir = _results_dir(save_dir)
+    frame_weights = out.get("frame_weights")
+
     for b in range(n):
         fig, axes = plt.subplots(1, 6, figsize=(18, 4))
 
@@ -494,7 +582,10 @@ def visualize_predictions(
             axes[t].imshow(
                 out["image_seq"][b, t].detach().cpu().permute(1, 2, 0).clamp(0, 1)
             )
-            axes[t].set_title(f"Input frame {t + 1}")
+            wt = ""
+            if frame_weights is not None:
+                wt = f"\n(w={frame_weights[b, t].item():.2f})"
+            axes[t].set_title(f"Input frame {t + 1}{wt}")
             axes[t].axis("off")
 
         axes[4].imshow(
@@ -517,13 +608,22 @@ def visualize_predictions(
             for t in range(4)
         ]
 
+        # Print the FULL (untruncated) target and predicted text for this sample.
+        print("=" * 80)
+        print(f"Sample {b + 1}")
+        for i, txt in enumerate(input_texts):
+            print(f"  Input {i + 1}: {txt}")
+        print(f"  TARGET 5   : {target_texts[b]}")
+        print(f"  PREDICTED 5: {pred_texts[b]}")
+        print()
+
+        # Keep the in-figure caption shortened so the image stays readable.
         text_block = "\n".join(
             [
                 f"Input {i + 1}: {textwrap.shorten(txt, width=130)}"
                 for i, txt in enumerate(input_texts)
             ]
         )
-
         text_block += "\n\n"
         text_block += "Target 5: " + textwrap.shorten(target_texts[b], width=170)
         text_block += "\n"
@@ -533,5 +633,118 @@ def visualize_predictions(
         fig.text(0.01, -0.05, text_block, fontsize=10, va="top")
 
         plt.tight_layout()
+
+        if out_dir is not None:
+            fig.savefig(
+                os.path.join(out_dir, f"prediction_sample_{b + 1}.png"),
+                bbox_inches="tight",
+                dpi=140,
+            )
+
         plt.show()
         plt.close(fig)
+
+    if out_dir is not None:
+        print(f"Saved prediction sample figures to {out_dir}")
+
+# =========================================================
+# Explainability: per-frame contribution (leave-one-out)
+# =========================================================
+
+@torch.no_grad()
+def frame_contribution_xai(
+    predictor,
+    dataloader,
+    device,
+    max_samples=3,
+    save_dir=None,
+):
+    """
+    Explains WHICH input frames drive the predicted image, two complementary ways:
+
+      * blend weight     -- the softmax weight the model assigns each frame when it
+                            builds the prediction anchor (what the model *reports*).
+      * leave-one-out    -- how much the prediction actually changes when that
+                            frame's image is greyed out (what the model *uses*).
+
+    Plotting both side by side shows whether the attention the model reports lines
+    up with the influence each frame really has on the output.
+    """
+    predictor.eval()
+
+    batch = next(iter(dataloader))
+    out = predict_batch(predictor, batch, device)
+
+    frames = out["image_seq"]            # [B, T, 3, H, W]
+    enc_ids = out["enc_ids"]
+    enc_mask = out["enc_mask"]
+    pred_full = out["pred_image"]        # [B, 3, H, W]
+    T = frames.size(1)
+
+    # Leave-one-out: grey out each frame, re-predict, measure the change in output.
+    sensitivity = torch.zeros(frames.size(0), T, device=device)
+    for t in range(T):
+        ablated = frames.clone()
+        ablated[:, t] = 0.5              # neutral grey
+        out_ab = predictor(
+            image_seq=ablated,
+            input_ids_text_encoder=enc_ids,
+            attention_mask_text_encoder=enc_mask,
+            target_seq_text_decoder=None,
+            image_target=None,
+            decode_image=True,
+        )
+        diff = (out_ab["pred_image"] - pred_full).flatten(1)
+        sensitivity[:, t] = diff.pow(2).mean(dim=1)
+
+    # Normalize each sample's leave-one-out effects into a comparable [0,1] profile.
+    sens_norm = sensitivity / sensitivity.sum(dim=1, keepdim=True).clamp_min(1e-8)
+    frame_weights = out.get("frame_weights")
+
+    out_dir = _results_dir(save_dir)
+    n = min(max_samples, frames.size(0))
+
+    for b in range(n):
+        fig, axes = plt.subplots(1, T + 2, figsize=(3 * (T + 2), 3.4))
+
+        for t in range(T):
+            axes[t].imshow(frames[b, t].detach().cpu().permute(1, 2, 0).clamp(0, 1))
+            axes[t].set_title(f"Frame {t + 1}")
+            axes[t].axis("off")
+
+        axes[T].imshow(pred_full[b].detach().cpu().permute(1, 2, 0).clamp(0, 1))
+        axes[T].set_title("Predicted")
+        axes[T].axis("off")
+
+        ax = axes[T + 1]
+        x = list(range(T))
+        loo = sens_norm[b].detach().cpu().numpy()
+        if frame_weights is not None:
+            w = frame_weights[b].detach().cpu().numpy()
+            ax.bar([i - 0.2 for i in x], w, width=0.4, label="blend weight")
+            ax.bar([i + 0.2 for i in x], loo, width=0.4, label="leave-one-out")
+        else:
+            ax.bar(x, loo, width=0.6, label="leave-one-out")
+        ax.legend(fontsize=8)
+        ax.set_xticks(x)
+        ax.set_xticklabels([f"f{i + 1}" for i in x])
+        ax.set_title("Per-frame contribution")
+        ax.set_ylim(0, 1)
+
+        fig.suptitle(f"Frame contribution XAI - sample {b + 1}", fontsize=13)
+        plt.tight_layout()
+
+        if out_dir is not None:
+            fig.savefig(
+                os.path.join(out_dir, f"frame_contribution_sample_{b + 1}.png"),
+                bbox_inches="tight",
+                dpi=140,
+            )
+
+        plt.show()
+        plt.close(fig)
+
+    if out_dir is not None:
+        print(f"Saved frame-contribution XAI figures to {out_dir}")
+
+    return {"leave_one_out_norm": sens_norm.detach().cpu()}

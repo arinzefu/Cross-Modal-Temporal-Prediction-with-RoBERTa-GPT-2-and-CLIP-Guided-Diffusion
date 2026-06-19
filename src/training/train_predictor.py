@@ -346,6 +346,12 @@ def collapse_report(predictor, out):
     print(f"  pred spatial      : {mean_pairwise_cos(out['pred_image_spatial']):.4f}")
     print(f"  text memory       : {mean_pairwise_cos(mem):.4f}")
 
+    fw = out.get("frame_weights")
+    if fw is not None:
+        mean_w = fw.mean(0).tolist()
+        print("  frame blend weights (mean over batch): "
+              + ", ".join(f"f{i+1}={w:.2f}" for i, w in enumerate(mean_w)))
+
 
 def print_latent_diagnostic(out, predictor=None):
     z_cos = F.cosine_similarity(
@@ -597,7 +603,11 @@ def visualize_validation_epoch(
         axes[4].axis("off")
 
         axes[5].imshow(out["pred_image"][b].detach().cpu().permute(1, 2, 0).clamp(0, 1))
-        axes[5].set_title("Predicted frame 5")
+        if out.get("frame_weights") is not None:
+            w = out["frame_weights"][b].detach().cpu().tolist()
+            axes[5].set_title("Predicted 5\nw=[" + ",".join(f"{x:.2f}" for x in w) + "]")
+        else:
+            axes[5].set_title("Predicted frame 5")
         axes[5].axis("off")
 
         axes[6].imshow(recon_anchor[b].detach().cpu().permute(1, 2, 0).clamp(0, 1))
@@ -660,6 +670,7 @@ def train_sequence_predictor(
     ctx_dropout_p_other=0.05,
     ctx_dropout_p_last=0.0,
     early_stop_patience=None,
+    frame_entropy_weight=0.02,
 ):
     os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -772,12 +783,23 @@ def train_sequence_predictor(
 
                 grad_loss = image_gradient_loss(out["pred_image"], image_target)
 
+                # Encourage the frame-blend weights to spread across frames
+                # (high entropy) so the prediction uses all 4 inputs rather than
+                # collapsing back onto a single frame. Subtracting entropy from the
+                # loss => minimizing the loss maximizes entropy.
+                fw = out.get("frame_weights")
+                if fw is not None:
+                    frame_entropy = -(fw * (fw + 1e-9).log()).sum(-1).mean()
+                else:
+                    frame_entropy = torch.zeros((), device=image_target.device)
+
                 loss = (
                     image_weight * image_loss
                     + text_weight * text_loss
                     + attn_balance_weight * attn_loss
                     + copy_margin_weight * copy_loss
                     + grad_weight * grad_loss
+                    - frame_entropy_weight * frame_entropy
                 )
 
             scaler.scale(loss).backward()
