@@ -1,0 +1,178 @@
+=== TEXT AUTOENCODER TRAINING LOG ===
+
+Epoch 1
+  CE Loss      : 3.021946
+  Div Loss     : 0.000000
+  Total Loss   : 3.021946
+  BLEU         : 0.012574
+  ROUGE-1      : 0.329114
+  ROUGE-2      : 0.042553
+  ROUGE-L      : 0.143460
+  METEOR       : 0.174430
+  Avg Overlap  : 0.138489
+
+Epoch 2
+  CE Loss      : 1.452200
+  Div Loss     : 0.000000
+  Total Loss   : 1.452200
+  BLEU         : 0.007859
+  ROUGE-1      : 0.333333
+  ROUGE-2      : 0.032000
+  ROUGE-L      : 0.142857
+  METEOR       : 0.208153
+  Avg Overlap  : 0.071197
+
+Epoch 3
+  CE Loss      : 0.855707
+  Div Loss     : 0.000000
+  Total Loss   : 0.855707
+  BLEU         : 0.007765
+  ROUGE-1      : 0.321285
+  ROUGE-2      : 0.032389
+  ROUGE-L      : 0.128514
+  METEOR       : 0.196874
+  Avg Overlap  : 0.080673
+
+Epoch 4
+  CE Loss      : 0.795532
+  Div Loss     : 0.000000
+  Total Loss   : 0.795532
+  BLEU         : 0.504260
+  ROUGE-1      : 0.749091
+  ROUGE-2      : 0.747253
+  ROUGE-L      : 0.749091
+  METEOR       : 0.508277
+  Avg Overlap  : 0.064548
+
+Epoch 5
+  CE Loss      : 0.777088
+  Div Loss     : 0.000000
+  Total Loss   : 0.777088
+  BLEU         : 0.504260
+  ROUGE-1      : 0.749091
+  ROUGE-2      : 0.747253
+  ROUGE-L      : 0.749091
+  METEOR       : 0.508277
+  Avg Overlap  : 0.069654
+
+Epoch 6
+  CE Loss      : 0.767411
+  Div Loss     : 0.000000
+  Total Loss   : 0.767411
+  BLEU         : 0.504260
+  ROUGE-1      : 0.749091
+  ROUGE-2      : 0.747253
+  ROUGE-L      : 0.749091
+  METEOR       : 0.508277
+  Avg Overlap  : 0.088857
+
+Epoch 7
+  CE Loss      : 0.759875
+  Div Loss     : 0.000000
+  Total Loss   : 0.759875
+  BLEU         : 0.018662
+  ROUGE-1      : 0.340496
+  ROUGE-2      : 0.338308
+  ROUGE-L      : 0.340496
+  METEOR       : 0.143930
+  Avg Overlap  : 0.086321
+
+Epoch 8
+  CE Loss      : 0.756404
+  Div Loss     : 0.000000
+  Total Loss   : 0.756404
+  BLEU         : 0.018662
+  ROUGE-1      : 0.340496
+  ROUGE-2      : 0.338308
+  ROUGE-L      : 0.340496
+  METEOR       : 0.143930
+  Avg Overlap  : 0.082239
+
+Epoch 9
+  CE Loss      : 0.753861
+  Div Loss     : 0.000000
+  Total Loss   : 0.753861
+  BLEU         : 0.018662
+  ROUGE-1      : 0.340496
+  ROUGE-2      : 0.338308
+  ROUGE-L      : 0.340496
+  METEOR       : 0.143930
+  Avg Overlap  : 0.081837
+
+Epoch 10
+  CE Loss      : 0.752120
+  Div Loss     : 0.000000
+  Total Loss   : 0.752120
+  BLEU         : 0.018662
+  ROUGE-1      : 0.340496
+  ROUGE-2      : 0.338308
+  ROUGE-L      : 0.340496
+  METEOR       : 0.143930
+  Avg Overlap  : 0.092311
+
+Epoch 11
+  CE Loss      : 0.750756
+  Div Loss     : 0.000000
+  Total Loss   : 0.750756
+  BLEU         : 0.018662
+  ROUGE-1      : 0.340496
+  ROUGE-2      : 0.338308
+  ROUGE-L      : 0.340496
+  METEOR       : 0.143930
+  Avg Overlap  : 0.083891
+
+Epoch 12
+  CE Loss      : 0.749787
+  Div Loss     : 0.000000
+  Total Loss   : 0.749787
+  BLEU         : 0.020058
+  ROUGE-1      : 0.345964
+  ROUGE-2      : 0.337190
+  ROUGE-L      : 0.342669
+  METEOR       : 0.143611
+  Avg Overlap  : 0.083921
+
+Epoch 13
+  CE Loss      : 0.749093
+  Div Loss     : 0.000000
+  Total Loss   : 0.749093
+  BLEU         : 0.020058
+  ROUGE-1      : 0.345964
+  ROUGE-2      : 0.337190
+  ROUGE-L      : 0.342669
+  METEOR       : 0.143611
+  Avg Overlap  : 0.088266
+
+Epoch 14
+  CE Loss      : 0.748636
+  Div Loss     : 0.000000
+  Total Loss   : 0.748636
+  BLEU         : 0.018662
+  ROUGE-1      : 0.340496
+  ROUGE-2      : 0.338308
+  ROUGE-L      : 0.340496
+  METEOR       : 0.143930
+  Avg Overlap  : 0.084656
+
+Epoch 15
+  CE Loss      : 0.748410
+  Div Loss     : 0.000000
+  Total Loss   : 0.748410
+  BLEU         : 0.018662
+  ROUGE-1      : 0.340496
+  ROUGE-2      : 0.338308
+  ROUGE-L      : 0.340496
+  METEOR       : 0.143930
+  Avg Overlap  : 0.083956
+
+Epoch 16
+  CE Loss      : 0.748309
+  Div Loss     : 0.000000
+  Total Loss   : 0.748309
+  BLEU         : 0.018662
+  ROUGE-1      : 0.340496
+  ROUGE-2      : 0.338308
+  ROUGE-L      : 0.340496
+  METEOR       : 0.143930
+  Avg Overlap  : 0.083956
+

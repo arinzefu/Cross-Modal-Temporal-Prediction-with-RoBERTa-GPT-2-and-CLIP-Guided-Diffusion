@@ -1,0 +1,11 @@
+torch
+torchvision
+transformers
+huggingface_hub
+fastapi
+uvicorn[standard]
+pydantic
+Pillow
+matplotlib
+numpy
+beautifulsoup4

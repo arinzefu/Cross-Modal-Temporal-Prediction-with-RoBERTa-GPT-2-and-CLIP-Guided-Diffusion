@@ -396,13 +396,6 @@ def print_latent_diagnostic(out, predictor=None):
     print("spatial cosine:", f"{spatial_cos.item():.4f}")
     print("spatial mse:", f"{spatial_mse.item():.4f}")
 
-    if predictor is not None and getattr(predictor, "predict_residual", False):
-        print(
-            "residual gates  z/spatial:",
-            f"{predictor.z_res_scale.item():.4f}",
-            f"{predictor.spatial_res_scale.item():.4f}",
-        )
-
 
 @torch.no_grad()
 def evaluate_predictor(
