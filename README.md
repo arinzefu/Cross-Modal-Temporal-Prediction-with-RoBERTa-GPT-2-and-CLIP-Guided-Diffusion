@@ -6,9 +6,9 @@ The diffusion was unable to generate from pure noise so this project became - Cr
 
 I used the visual autoencoder for a latent prediction task instead
 
-The attention can be found in [src/models/sequence_predictor.py]
+The attention module can be found in [`src/models/sequence_predictor.py`](src/models/sequence_predictor.py).
 
-The main notebook is [03_multimodal_temporal_predictor.py]
+The main notebook/script is [`03_multimodal_temporal_predictor.py`](03_multimodal_temporal_predictor.py).
 
 Overall the model displayed positive results but was limited to the dataset provide, it was able to retrain the structural meaning of the sentences for the story dataset but the latent prediction for the visual task was not entirely solved.
 
