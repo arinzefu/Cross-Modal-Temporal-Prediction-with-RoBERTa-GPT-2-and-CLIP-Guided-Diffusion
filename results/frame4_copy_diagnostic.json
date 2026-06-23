@@ -1,0 +1,6 @@
+{
+  "pred_to_target_mse": 0.08627204895019532,
+  "pred_to_frame4_mse": 0.06891206502914429,
+  "target_to_frame4_mse": 0.1575205683708191,
+  "mean_visual_attention_on_frame4": 0.25369778275489807
+}
